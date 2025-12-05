@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # VPS 使用 resolvconf 的 DNS 切换脚本
 # 功能：
-#  - 菜单选择流媒体 DNS
+#  - 菜单选择流媒体 DNS（中文+国旗）
 #  - 实时显示当前 DNS
 #  - 修改 /etc/resolvconf/resolv.conf.d/base 并更新
 #  - 强制把新 DNS 放到 /etc/resolv.conf 第一位
+#  - 根据地区选择专属测试域名
 #  - 自动测试 DNS 是否正常工作
 
 set -e
@@ -23,16 +24,16 @@ fi
 echo "================ 流媒体解锁 DNS 地区选择 ================"
 echo "（当前生效 DNS：$CURRENT_DNS）"
 echo
-echo " 1) Default  默认         154.83.83.83"
-echo " 2) HK       香港         154.83.83.84"
-echo " 3) JP       日本         154.83.83.85"
-echo " 4) TW       台湾         154.83.83.86"
-echo " 5) SG       新加坡       154.83.83.87"
-echo " 6) US       美国         154.83.83.88"
-echo " 7) UK       英国         154.83.83.89"
-echo " 8) DE       德国         154.83.83.90"
+echo " 1) 🇨🇳 默认          154.83.83.83"
+echo " 2) 🇭🇰 香港          154.83.83.84"
+echo " 3) 🇯🇵 日本          154.83.83.85"
+echo " 4) 🇼🇸 台湾          154.83.83.86"
+echo " 5) 🇸🇬 新加坡        154.83.83.87"
+echo " 6) 🇺🇸 美国          154.83.83.88"
+echo " 7) 🇬🇧 英国          154.83.83.89"
+echo " 8) 🇩🇪 德国          154.83.83.90"
 echo "----------------------------------------------------------"
-echo " 0) 自定义手动输入 DNS"
+echo " 0) ✏️ 自定义手动输入 DNS"
 echo "=========================================================="
 read -rp "请输入要使用的编号(0-8): " CHOICE
 
@@ -40,17 +41,17 @@ REGION=""
 DNS_IP=""
 
 case "$CHOICE" in
-  1) REGION="Default";        DNS_IP="154.83.83.83" ;;
-  2) REGION="Hong Kong";      DNS_IP="154.83.83.84" ;;
-  3) REGION="Japan";          DNS_IP="154.83.83.85" ;;
-  4) REGION="Taiwan";         DNS_IP="154.83.83.86" ;;
-  5) REGION="Singapore";      DNS_IP="154.83.83.87" ;;
-  6) REGION="United States";  DNS_IP="154.83.83.88" ;;
-  7) REGION="United Kingdom"; DNS_IP="154.83.83.89" ;;
-  8) REGION="Germany";        DNS_IP="154.83.83.90" ;;
+  1) REGION="🇨🇳 默认";      DNS_IP="154.83.83.83" ;;
+  2) REGION="🇭🇰 香港";      DNS_IP="154.83.83.84" ;;
+  3) REGION="🇯🇵 日本";      DNS_IP="154.83.83.85" ;;
+  4) REGION="🇼🇸 台湾";      DNS_IP="154.83.83.86" ;;
+  5) REGION="🇸🇬 新加坡";    DNS_IP="154.83.83.87" ;;
+  6) REGION="🇺🇸 美国";      DNS_IP="154.83.83.88" ;;
+  7) REGION="🇬🇧 英国";      DNS_IP="154.83.83.89" ;;
+  8) REGION="🇩🇪 德国";      DNS_IP="154.83.83.90" ;;
   0)
     read -rp "请输入自定义 DNS: " DNS_IP
-    REGION="Custom"
+    REGION="✏️ 自定义"
     ;;
   *)
     echo "❌ 无效选择，退出。"
@@ -96,9 +97,26 @@ echo "➡ 最终生效的 /etc/resolv.conf："
 cat "$RESOLV_CONF"
 
 echo
-echo "➡ 正在测试 DNS 是否正常工作..."
 
+# ==============================
+#   根据地区选择测试域名
+# ==============================
 TEST_DOMAIN="www.google.com"
+TEST_DESC="通用测试域名"
+
+case "$CHOICE" in
+  2) TEST_DOMAIN="viu.com";               TEST_DESC="香港 ViuTV";;
+  3) TEST_DOMAIN="dmm.com";               TEST_DESC="日本 DMM";;
+  4) TEST_DOMAIN="ani.gamer.com.tw";      TEST_DESC="台湾 动画疯";;
+  5) TEST_DOMAIN="mewatch.sg";            TEST_DESC="新加坡 meWATCH";;
+  6) TEST_DOMAIN="netflix.com";           TEST_DESC="美国 Netflix";;
+  7) TEST_DOMAIN="bbc.co.uk";             TEST_DESC="英国 BBC";;
+  8) TEST_DOMAIN="dw.com";                TEST_DESC="德国之声 DW";;
+  1) TEST_DOMAIN="www.google.com";        TEST_DESC="通用测试域名";;
+  0) TEST_DOMAIN="www.google.com";        TEST_DESC="通用测试域名";;
+esac
+
+echo "➡ 正在测试 DNS 是否正常工作（地区测试域名：$TEST_DOMAIN，$TEST_DESC）..."
 
 if command -v getent >/dev/null 2>&1; then
   if getent hosts "$TEST_DOMAIN" >/dev/null 2>&1; then
