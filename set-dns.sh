@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# VPS 使用 resolvconf 的 DNS 切换脚本（含实时 DNS 显示 + 强制把新 DNS 放第一位）
+# VPS 使用 resolvconf 的 DNS 切换脚本
+# 功能：
+#  - 菜单选择流媒体 DNS
+#  - 实时显示当前 DNS
+#  - 修改 /etc/resolvconf/resolv.conf.d/base 并更新
+#  - 强制把新 DNS 放到 /etc/resolv.conf 第一位
+#  - 自动测试 DNS 是否正常工作
 
 set -e
 
@@ -88,6 +94,26 @@ rm -f "$TMP_FILE"
 echo
 echo "➡ 最终生效的 /etc/resolv.conf："
 cat "$RESOLV_CONF"
+
+echo
+echo "➡ 正在测试 DNS 是否正常工作..."
+
+TEST_DOMAIN="www.google.com"
+
+if command -v getent >/dev/null 2>&1; then
+  if getent hosts "$TEST_DOMAIN" >/dev/null 2>&1; then
+    echo "✅ DNS 解析正常：$TEST_DOMAIN 可以被解析"
+  else
+    echo "❌ DNS 解析失败：无法解析 $TEST_DOMAIN"
+  fi
+else
+  # 没有 getent 时，用 ping 做兜底测试
+  if ping -c 3 -W 2 "$TEST_DOMAIN" >/dev/null 2>&1; then
+    echo "✅ DNS / 网络测试正常：可以访问 $TEST_DOMAIN"
+  else
+    echo "❌ DNS / 网络测试失败：无法访问 $TEST_DOMAIN"
+  fi
+fi
 
 echo
 echo "🎉 DNS 切换完成！当前地区：$REGION（$DNS_IP）"
