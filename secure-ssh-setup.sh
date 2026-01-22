@@ -9,11 +9,11 @@ set -euo pipefail
 # - Firewall helper (ufw/firewalld/iptables)
 # - Optional /etc/hosts fix for sudo resolve host
 # - Sudo setup helper (install sudo if missing, optional NOPASSWD, or set user password)
-# - NEW: Install UFW helper
-# - NEW: System update helper
-# - NEW: Show firewall allowed rules/ports + offer to enable if inactive (UFW)
-# - NEW: Fail2ban (auto-detect log source, fallback to systemd journal)
-# - NEW: Extension Port (generate a template file for future tools)
+# - Install/Enable UFW helper
+# - System update helper
+# - Show firewall allowed rules/ports + offer to enable if inactive (UFW)
+# - Fail2ban submenu (8 options): install/fix/start, status, show config, tune, whitelist, unban, ban list & logs, banaction switch
+# - Expansion slot: generate template text for future tools/scripts
 # =========================
 
 # ---------- colors ----------
@@ -413,7 +413,7 @@ firewall_close_port() {
   esac
 }
 
-# ---------- NEW: show allowed rules/ports + offer enable if inactive ----------
+# ---------- show allowed rules/ports + offer enable if inactive ----------
 firewall_show_rules_menu() {
   echo
   hr
@@ -438,6 +438,7 @@ firewall_show_rules_menu() {
       echo "${CCYA}ℹ️  UFW 状态：${C0}${st}"
       echo
 
+      # 方法一：在查看时如果 inactive，就提示并可一键启用（并放行当前 SSH 端口）
       if echo "$st" | grep -qi "inactive"; then
         warn "UFW 当前未启用（inactive）"
         echo "你可以选择现在启用（会自动放行当前 SSH 端口：$(get_current_port)/tcp）"
@@ -638,200 +639,621 @@ rollback_menu() {
   ok "已回滚到：$chosen 并重启 SSH 服务"
 }
 
-# ---------- NEW: Fail2ban (auto log source) ----------
-fail2ban_menu() {
-  echo
-  hr
-  echo "${CBOLD}${CBLU}Fail2ban（一键安装/修复/启动）${C0}"
-  hr
+# ============================================================
+# 12) FAIL2BAN 子菜单（8 选项）—— 你以后不用记命令
+# ============================================================
 
-  # 1) install
-  if ! command -v fail2ban-client >/dev/null 2>&1; then
-    info "检测到未安装 fail2ban，开始安装…"
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y || true
-      DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || die "fail2ban 安装失败（apt）"
-    elif command -v dnf >/dev/null 2>&1; then
-      dnf install -y fail2ban || die "fail2ban 安装失败（dnf）"
-    elif command -v yum >/dev/null 2>&1; then
-      yum install -y fail2ban || die "fail2ban 安装失败（yum）"
-    else
-      die "未识别包管理器，无法自动安装 fail2ban"
-    fi
-    ok "fail2ban 已安装"
-  else
-    ok "fail2ban 已安装"
+F2B_JAIL_LOCAL="/etc/fail2ban/jail.local"
+F2B_MARK_BEGIN="# ==== managed by Secure SSH Setup (Fail2ban) BEGIN ===="
+F2B_MARK_END="# ==== managed by Secure SSH Setup (Fail2ban) END ===="
+
+# ---- 简单校验：IP 或 CIDR（够用版）----
+valid_ip_or_cidr() {
+  local s="${1:-}"
+  [[ -n "$s" ]] || return 1
+  # IPv4
+  if [[ "$s" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+    return 0
   fi
-
-  # 2) ensure jail.local
-  local JAIL_LOCAL="/etc/fail2ban/jail.local"
-  if [[ ! -f "$JAIL_LOCAL" ]]; then
-    info "未发现 jail.local，创建默认配置：$JAIL_LOCAL"
-    cat > "$JAIL_LOCAL" <<'EOF'
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-
-[sshd]
-enabled  = true
-EOF
-    ok "已创建 jail.local"
-  else
-    ok "已存在 jail.local：$JAIL_LOCAL"
+  # IPv6（宽松）
+  if [[ "$s" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]]; then
+    return 0
   fi
+  return 1
+}
 
-  # 3) auto detect log source
-  local use_systemd="no"
+# ---- 检测日志来源：优先 auth.log / secure，否则 systemd journal ----
+f2b_detect_log_mode() {
+  # 返回两项：mode|logpath
+  # mode: file-authlog / file-secure / systemd
+  # logpath: 对应 logpath 值
   if [[ -f /var/log/auth.log ]]; then
-    ok "检测到日志：/var/log/auth.log"
-    use_systemd="no"
-  elif [[ -f /var/log/secure ]]; then
-    ok "检测到日志：/var/log/secure"
-    use_systemd="no"
+    echo "file-authlog|/var/log/auth.log"
+    return 0
+  fi
+  if [[ -f /var/log/secure ]]; then
+    echo "file-secure|/var/log/secure"
+    return 0
+  fi
+  # 关键：很多 Debian 新系统没写 auth.log，而是进 journal，所以要这样写
+  echo "systemd|%(systemd_journal)s"
+}
+
+# ---- 安装 fail2ban（自动识别 apt/yum/dnf；偏向 Debian/Ubuntu）----
+f2b_install_if_needed() {
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    ok "fail2ban 已安装"
+    return 0
+  fi
+
+  warn "未检测到 fail2ban，开始安装…"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || die "fail2ban 安装失败（apt）"
+    ok "fail2ban 已安装（apt）"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y fail2ban || die "fail2ban 安装失败（dnf）"
+    ok "fail2ban 已安装（dnf）"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y fail2ban || die "fail2ban 安装失败（yum）"
+    ok "fail2ban 已安装（yum）"
   else
-    warn "未检测到 /var/log/auth.log 或 /var/log/secure"
-    warn "将自动切换为 systemd journal 模式：backend=systemd + logpath=%(systemd_journal)s"
-    use_systemd="yes"
+    die "未识别包管理器（apt/yum/dnf），无法自动安装 fail2ban"
+  fi
+}
+
+# ---- 确保 jail.local 存在（不乱改用户其他配置）----
+f2b_ensure_jail_local() {
+  if [[ -f "$F2B_JAIL_LOCAL" ]]; then
+    ok "已存在 jail.local：$F2B_JAIL_LOCAL"
+    return 0
   fi
 
-  if [[ "$use_systemd" == "yes" ]]; then
-    # append or replace in [sshd] section
-    # ensure [sshd] exists
-    if ! grep -qiE '^\[sshd\]' "$JAIL_LOCAL"; then
-      echo -e "\n[sshd]\nenabled = true" >> "$JAIL_LOCAL"
-    fi
+  # 如果不存在，生成一个最小 jail.local
+  cat > "$F2B_JAIL_LOCAL" <<'EOF'
+[DEFAULT]
+# 这是 fail2ban 的本地配置文件（优先级高于 jail.conf）
+# 你手动加的配置也可以写在这里。
+EOF
+  ok "已创建 jail.local：$F2B_JAIL_LOCAL"
+}
 
-    # remove existing backend/logpath (within file scope)
-    sed -i -E '/^[[:space:]]*(backend|logpath)[[:space:]]*=/Id' "$JAIL_LOCAL"
+# ---- 写入“受控区块”配置（只改这段，别的都不动）----
+f2b_write_managed_block() {
+  local port="$1"
+  local backend="$2"
+  local logpath="$3"
+  local maxretry="$4"
+  local findtime="$5"
+  local bantime="$6"
+  local ignoreip="$7"
+  local banaction="$8"
 
-    # add settings right after [sshd]
-    awk '
-      BEGIN{IGNORECASE=1}
-      {print}
-      tolower($0)=="[sshd]"{
-        print "backend = systemd"
-        print "logpath = %(systemd_journal)s"
+  # 1) 先把旧的受控区块删掉（如果存在）
+  local tmp
+  tmp="$(mktemp)"
+  awk -v b="$F2B_MARK_BEGIN" -v e="$F2B_MARK_END" '
+    BEGIN{inblk=0}
+    {
+      if ($0==b) {inblk=1; next}
+      if ($0==e) {inblk=0; next}
+      if (!inblk) print $0
+    }
+  ' "$F2B_JAIL_LOCAL" > "$tmp"
+
+  # 2) 追加新的受控区块
+  {
+    echo ""
+    echo "$F2B_MARK_BEGIN"
+    echo "# 这段由脚本维护：用于 sshd 防爆破（你以后不需要记命令）"
+    echo "# 如果你要自己深度定制 fail2ban，请写到本文件其它区域；脚本不会动你其它配置"
+    echo ""
+    echo "[DEFAULT]"
+    echo "# 白名单：避免你自己被误封（建议把你常用固定出口 IP 也加进来）"
+    echo "ignoreip = ${ignoreip}"
+    echo ""
+    echo "[sshd]"
+    echo "enabled = true"
+    echo "# 自动读取你 SSH 当前端口（不是写死 22）"
+    echo "port = ${port}"
+    echo "# 日志来源：file 或 systemd（脚本自动识别）"
+    echo "backend = ${backend}"
+    echo "logpath = ${logpath}"
+    echo ""
+    echo "# 防爆破强度（可在菜单里改）："
+    echo "maxretry = ${maxretry}"
+    echo "findtime = ${findtime}"
+    echo "bantime  = ${bantime}"
+    echo ""
+    echo "# 封禁动作：默认 iptables-multiport；如果你用 ufw，也可切换 banaction=ufw"
+    echo "banaction = ${banaction}"
+    echo "$F2B_MARK_END"
+    echo ""
+  } >> "$tmp"
+
+  cp "$tmp" "$F2B_JAIL_LOCAL"
+  rm -f "$tmp"
+  ok "已写入 Fail2ban 受控配置到 jail.local（只维护 BEGIN/END 区块）"
+}
+
+# ---- 从受控区块读取当前参数（读不到就给默认）----
+f2b_get_managed_value() {
+  local key="$1"
+  local def="$2"
+  local v=""
+  v="$(awk -v b="$F2B_MARK_BEGIN" -v e="$F2B_MARK_END" -v k="$key" '
+    BEGIN{inblk=0}
+    $0==b{inblk=1; next}
+    $0==e{inblk=0; next}
+    inblk==1{
+      # 支持 key = value 或 key=value
+      gsub(/^[ \t]+|[ \t]+$/, "", $0)
+      if ($0 ~ ("^" k "[ \t]*=")) {
+        sub("^" k "[ \t]*=[ \t]*", "", $0)
+        print $0
+        exit
       }
-    ' "$JAIL_LOCAL" > "${JAIL_LOCAL}.tmp" && mv "${JAIL_LOCAL}.tmp" "$JAIL_LOCAL"
-
-    ok "已写入 systemd journal 配置到 jail.local"
+    }
+  ' "$F2B_JAIL_LOCAL" 2>/dev/null || true)"
+  if [[ -n "$v" ]]; then
+    echo "$v"
+  else
+    echo "$def"
   fi
+}
 
-  # 4) start/restart
+# ---- 计算默认 ignoreip（含 IPv6 loopback）----
+f2b_default_ignoreip() {
+  echo "127.0.0.1/8 ::1"
+}
+
+# ---- 确保 fail2ban 启动并打印状态 ----
+f2b_restart_and_show() {
   info "尝试启动/重启 fail2ban…"
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable fail2ban >/dev/null 2>&1 || true
-    systemctl restart fail2ban || true
+    systemctl restart fail2ban >/dev/null 2>&1 || true
   else
-    service fail2ban restart || true
+    service fail2ban restart >/dev/null 2>&1 || true
   fi
 
   echo
   hr
   echo "${CBOLD}${CBLU}状态输出${C0}"
   hr
-  if command -v systemctl >/dev/null 2>&1; then
-    echo "${CCYA}ℹ️  service 状态：${C0}"
-    systemctl status fail2ban --no-pager -l 2>/dev/null || true
-    echo
-  fi
+  echo "${CCYA}ℹ️  service 状态：${C0}"
+  systemctl status fail2ban --no-pager 2>/dev/null || true
 
+  echo
   echo "${CCYA}ℹ️  fail2ban-client status：${C0}"
   fail2ban-client status 2>/dev/null || true
+
+  echo
+  echo "${CCYA}ℹ️  sshd jail：${C0}"
+  fail2ban-client status sshd 2>/dev/null || true
+}
+
+# ---- (12-1) 一键安装/修复/启动：核心入口 ----
+f2b_one_click_fix_start() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：一键安装/修复/启动（推荐）${C0}"
+  hr
+
+  f2b_install_if_needed
+  f2b_ensure_jail_local
+
+  # 识别日志源
+  local mode_log
+  mode_log="$(f2b_detect_log_mode)"
+  local mode="${mode_log%%|*}"
+  local logpath="${mode_log##*|}"
+
+  if [[ "$mode" == "file-authlog" ]]; then
+    ok "检测到日志文件：/var/log/auth.log"
+    local backend="auto"
+  elif [[ "$mode" == "file-secure" ]]; then
+    ok "检测到日志文件：/var/log/secure"
+    local backend="auto"
+  else
+    warn "未检测到 /var/log/auth.log 或 /var/log/secure"
+    warn "将自动切换为 systemd journal 模式：backend=systemd + logpath=%(systemd_journal)s"
+    local backend="systemd"
+  fi
+
+  # 读取 SSH 端口（你改过 Port 就跟着走）
+  local port
+  port="$(get_current_port)"
+
+  # 若已有受控区块，尽量沿用用户改过的参数；没有就用默认
+  local maxretry findtime bantime ignoreip banaction
+  maxretry="$(f2b_get_managed_value "maxretry" "5")"
+  findtime="$(f2b_get_managed_value "findtime" "10m")"
+  bantime="$(f2b_get_managed_value "bantime"  "1h")"
+  ignoreip="$(f2b_get_managed_value "ignoreip" "$(f2b_default_ignoreip)")"
+  banaction="$(f2b_get_managed_value "banaction" "iptables-multiport")"
+
+  # 写入受控区块
+  f2b_write_managed_block "$port" "$backend" "$logpath" "$maxretry" "$findtime" "$bantime" "$ignoreip" "$banaction"
+
+  # 启动并展示
+  f2b_restart_and_show
+
+  echo
+  warn "提示：即使你已禁用 SSH 密码登录，fail2ban 仍有意义（挡扫描/爆破/异常连接）。"
+  read -r -p "回车继续..." _
+}
+
+# ---- (12-2) 查看状态 ----
+f2b_show_status() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：查看状态（service + jail）${C0}"
+  hr
+
+  echo "${CCYA}ℹ️  service 状态：${C0}"
+  systemctl status fail2ban --no-pager 2>/dev/null || true
+
+  echo
+  echo "${CCYA}ℹ️  fail2ban-client status：${C0}"
+  fail2ban-client status 2>/dev/null || true
+
   echo
   echo "${CCYA}ℹ️  sshd jail：${C0}"
   fail2ban-client status sshd 2>/dev/null || true
 
-  echo
-  warn "提示：如果你已在 SSH 里禁用密码登录，fail2ban 仍有意义（挡扫描/爆破/异常连接）。"
   read -r -p "回车继续..." _
 }
 
-# ---------- NEW: Extension Port ----------
-extension_port_menu() {
+# ---- (12-3) 查看当前关键配置（让你一眼看懂）----
+f2b_show_config_summary() {
   echo
   hr
-  echo "${CBOLD}${CBLU}拓展口：生成“未来新增工具/脚本”的文本模板${C0}"
+  echo "${CBOLD}${CBLU}Fail2ban：查看当前配置摘要（关键参数）${C0}"
   hr
-  echo "用途：以后你想加新工具，不用先改主脚本；先点这里生成模板文件，往里写需求/命令/代码骨架。"
+
+  [[ -f "$F2B_JAIL_LOCAL" ]] || { warn "未找到 $F2B_JAIL_LOCAL（建议先跑 12-1）"; read -r -p "回车继续..." _; return 0; }
+
+  local port backend logpath maxretry findtime bantime ignoreip banaction
+  port="$(f2b_get_managed_value "port" "$(get_current_port)")"
+  backend="$(f2b_get_managed_value "backend" "auto")"
+  logpath="$(f2b_get_managed_value "logpath" "/var/log/auth.log")"
+  maxretry="$(f2b_get_managed_value "maxretry" "5")"
+  findtime="$(f2b_get_managed_value "findtime" "10m")"
+  bantime="$(f2b_get_managed_value "bantime" "1h")"
+  ignoreip="$(f2b_get_managed_value "ignoreip" "$(f2b_default_ignoreip)")"
+  banaction="$(f2b_get_managed_value "banaction" "iptables-multiport")"
+
+  echo "${CCYA}ℹ️  jail.local 文件：${C0}${F2B_JAIL_LOCAL}"
+  echo "${CCYA}ℹ️  SSH 端口：${C0}${port}"
+  echo "${CCYA}ℹ️  backend：${C0}${backend}"
+  echo "${CCYA}ℹ️  logpath：${C0}${logpath}"
+  echo "${CCYA}ℹ️  maxretry：${C0}${maxretry}"
+  echo "${CCYA}ℹ️  findtime：${C0}${findtime}"
+  echo "${CCYA}ℹ️  bantime ：${C0}${bantime}"
+  echo "${CCYA}ℹ️  ignoreip：${C0}${ignoreip}"
+  echo "${CCYA}ℹ️  banaction：${C0}${banaction}"
+
   echo
-
-  local title
-  read -r -p "给这次扩展起个名字（例如: x-ui备份/iptables持久化）[可留空]: " title
-  title="${title:-Extension}"
-
-  local out="/root/secure_ssh_setup_extensions_$(date +%F_%H%M%S).md"
-
-  cat > "$out" <<EOF
-# Secure SSH Setup - Extensions
-生成时间：$(date)
-扩展标题：${title}
-
----
-
-## 1) 需求描述
-- 你想加什么功能/工具：
-- 目标系统：Debian/Ubuntu/CentOS/通用？
-- 是否需要端口/防火墙规则：
-- 是否需要 systemd 服务：
-- 风险点（会不会锁外/会不会断网）：
-
----
-
-## 2) 手工命令（先在 VPS 上验证能跑通）
-把你手工验证过的命令写在这里：
-
-\`\`\`bash
-# example:
-# apt-get update -y
-# apt-get install -y xxx
-\`\`\`
-
----
-
-## 3) 集成到主脚本的代码骨架（复制到脚本里）
-### 3.1 新增函数模板
-\`\`\`bash
-my_new_tool_menu() {
-  echo
+  echo "${CBOLD}${CBLU}受控区块内容（只维护这一段）${C0}"
   hr
-  echo "\${CBOLD}\${CBLU}我的新工具：<名字>\${C0}"
-  hr
-
-  # TODO: commands here
+  awk -v b="$F2B_MARK_BEGIN" -v e="$F2B_MARK_END" '
+    $0==b{in=1}
+    in==1{print}
+    $0==e{in=0}
+  ' "$F2B_JAIL_LOCAL" 2>/dev/null || true
 
   read -r -p "回车继续..." _
 }
-\`\`\`
 
-### 3.2 菜单显示位置（main_menu 的 echo 区域）
-\`\`\`bash
-echo "  XX) <你的新功能说明>"
-\`\`\`
+# ---- (12-4) 调整防爆破强度（maxretry/findtime/bantime）----
+f2b_tune_strength() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：调整防爆破强度（maxretry/findtime/bantime）${C0}"
+  hr
 
-### 3.3 case 分支（main_menu 的 case "\$c" in）
-\`\`\`bash
-XX)
-  my_new_tool_menu
-  ;;
-\`\`\`
+  f2b_install_if_needed
+  f2b_ensure_jail_local
 
----
+  # 先确保受控区块存在（没有就先跑一键）
+  if ! grep -qF "$F2B_MARK_BEGIN" "$F2B_JAIL_LOCAL" 2>/dev/null; then
+    warn "未检测到受控配置区块（建议先跑 12-1 一键安装/修复/启动）"
+    read -r -p "现在直接跑 12-1 吗？输入 YES 继续: " ans
+    [[ "$ans" == "YES" ]] || { warn "已取消"; read -r -p "回车继续..." _; return 0; }
+    f2b_one_click_fix_start
+    return 0
+  fi
 
-## 4) 测试清单（必须）
-- [ ] 新开一个 SSH 会话确认能登录
-- [ ] 云厂商安全组端口确认放行
-- [ ] ufw/firewalld/iptables 规则确认无误
-- [ ] systemctl status <service> 正常
+  local cur_max cur_find cur_ban
+  cur_max="$(f2b_get_managed_value "maxretry" "5")"
+  cur_find="$(f2b_get_managed_value "findtime" "10m")"
+  cur_ban="$(f2b_get_managed_value "bantime" "1h")"
+
+  echo "当前值：maxretry=${cur_max}, findtime=${cur_find}, bantime=${cur_ban}"
+  echo
+  echo "输入建议："
+  echo "  - maxretry：数字（例如 5）"
+  echo "  - findtime：例如 10m / 5m / 1h"
+  echo "  - bantime ：例如 1h / 6h / 1d"
+  echo
+
+  local maxretry findtime bantime
+  read -r -p "maxretry [默认 ${cur_max}]: " maxretry
+  read -r -p "findtime [默认 ${cur_find}]: " findtime
+  read -r -p "bantime  [默认 ${cur_ban}]: " bantime
+  maxretry="${maxretry:-$cur_max}"
+  findtime="${findtime:-$cur_find}"
+  bantime="${bantime:-$cur_ban}"
+
+  # 沿用其它参数
+  local port backend logpath ignoreip banaction
+  port="$(f2b_get_managed_value "port" "$(get_current_port)")"
+  backend="$(f2b_get_managed_value "backend" "auto")"
+  logpath="$(f2b_get_managed_value "logpath" "/var/log/auth.log")"
+  ignoreip="$(f2b_get_managed_value "ignoreip" "$(f2b_default_ignoreip)")"
+  banaction="$(f2b_get_managed_value "banaction" "iptables-multiport")"
+
+  f2b_write_managed_block "$port" "$backend" "$logpath" "$maxretry" "$findtime" "$bantime" "$ignoreip" "$banaction"
+  f2b_restart_and_show
+  read -r -p "回车继续..." _
+}
+
+# ---- (12-5) 白名单 ignoreip 管理（避免你自己被封）----
+f2b_manage_whitelist() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：白名单（ignoreip）管理${C0}"
+  hr
+
+  f2b_install_if_needed
+  f2b_ensure_jail_local
+
+  # 如果没受控区块，先引导一键
+  if ! grep -qF "$F2B_MARK_BEGIN" "$F2B_JAIL_LOCAL" 2>/dev/null; then
+    warn "未检测到受控配置区块（建议先跑 12-1）"
+    read -r -p "现在直接跑 12-1 吗？输入 YES 继续: " ans
+    [[ "$ans" == "YES" ]] || { warn "已取消"; read -r -p "回车继续..." _; return 0; }
+    f2b_one_click_fix_start
+    return 0
+  fi
+
+  local ignoreip
+  ignoreip="$(f2b_get_managed_value "ignoreip" "$(f2b_default_ignoreip)")"
+
+  echo "${CCYA}ℹ️  当前 ignoreip：${C0}${ignoreip}"
+  echo
+  echo "  1) 添加一个 IP/CIDR（推荐把你常用固定出口 IP 加进来）"
+  echo "  2) 恢复默认（127.0.0.1/8 ::1）"
+  echo "  0) 返回"
+  read -r -p "请选择: " c
+
+  case "$c" in
+    1)
+      local add
+      read -r -p "输入要加入白名单的 IP/CIDR（例如 1.2.3.4 或 1.2.3.0/24）: " add
+      valid_ip_or_cidr "$add" || { warn "格式不对（不是 IP/CIDR）"; read -r -p "回车继续..." _; return 0; }
+
+      # 去重追加
+      if [[ " $ignoreip " == *" $add "* ]]; then
+        ok "已存在：$add（无需重复添加）"
+      else
+        ignoreip="${ignoreip} ${add}"
+        ok "已添加到 ignoreip：$add"
+      fi
+      ;;
+    2)
+      ignoreip="$(f2b_default_ignoreip)"
+      ok "已恢复默认 ignoreip"
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      warn "无效选择"
+      read -r -p "回车继续..." _
+      return 0
+      ;;
+  esac
+
+  # 写回配置（沿用其它参数）
+  local port backend logpath maxretry findtime bantime banaction
+  port="$(f2b_get_managed_value "port" "$(get_current_port)")"
+  backend="$(f2b_get_managed_value "backend" "auto")"
+  logpath="$(f2b_get_managed_value "logpath" "/var/log/auth.log")"
+  maxretry="$(f2b_get_managed_value "maxretry" "5")"
+  findtime="$(f2b_get_managed_value "findtime" "10m")"
+  bantime="$(f2b_get_managed_value "bantime" "1h")"
+  banaction="$(f2b_get_managed_value "banaction" "iptables-multiport")"
+
+  f2b_write_managed_block "$port" "$backend" "$logpath" "$maxretry" "$findtime" "$bantime" "$ignoreip" "$banaction"
+  f2b_restart_and_show
+  read -r -p "回车继续..." _
+}
+
+# ---- (12-6) 解封 IP（unban）----
+f2b_unban_ip() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：解封 IP（unban）${C0}"
+  hr
+
+  f2b_install_if_needed
+
+  local ip
+  read -r -p "输入要解封的 IP: " ip
+  valid_ip_or_cidr "$ip" || { warn "格式不对（不是 IP）"; read -r -p "回车继续..." _; return 0; }
+
+  # 这里必须用 fail2ban-client 对 sshd jail 解封
+  fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 || warn "解封命令执行失败（可能 jail 未启用/不存在/服务未运行）"
+  ok "已尝试解封：$ip"
+
+  echo
+  echo "${CCYA}ℹ️  当前 sshd ban 列表：${C0}"
+  fail2ban-client get sshd banip 2>/dev/null || true
+
+  read -r -p "回车继续..." _
+}
+
+# ---- (12-7) 查看被封列表 + 最近 fail2ban 日志 ----
+f2b_show_bans_and_logs() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：查看被封列表 + 最近封禁日志${C0}"
+  hr
+
+  f2b_install_if_needed
+
+  echo "${CCYA}ℹ️  sshd ban 列表：${C0}"
+  fail2ban-client get sshd banip 2>/dev/null || true
+
+  echo
+  echo "${CCYA}ℹ️  最近 fail2ban 日志（journalctl -u fail2ban -n 80）：${C0}"
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u fail2ban -n 80 --no-pager 2>/dev/null || true
+  else
+    warn "系统没有 journalctl，跳过日志查看"
+  fi
+
+  read -r -p "回车继续..." _
+}
+
+# ---- (12-8) 选择封禁方式 banaction（iptables 或 ufw）----
+f2b_switch_banaction() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban：选择封禁方式（banaction）${C0}"
+  hr
+
+  f2b_install_if_needed
+  f2b_ensure_jail_local
+
+  # 确保受控区块存在
+  if ! grep -qF "$F2B_MARK_BEGIN" "$F2B_JAIL_LOCAL" 2>/dev/null; then
+    warn "未检测到受控配置区块（建议先跑 12-1）"
+    read -r -p "现在直接跑 12-1 吗？输入 YES 继续: " ans
+    [[ "$ans" == "YES" ]] || { warn "已取消"; read -r -p "回车继续..." _; return 0; }
+    f2b_one_click_fix_start
+    return 0
+  fi
+
+  local cur
+  cur="$(f2b_get_managed_value "banaction" "iptables-multiport")"
+  echo "当前 banaction：${cur}"
+  echo
+
+  # 检测 ufw 是否可用且 active
+  local ufw_ok="no"
+  if command -v ufw >/dev/null 2>&1; then
+    local st
+    st="$(ufw status 2>/dev/null | head -n1 || true)"
+    if echo "$st" | grep -qi "active"; then
+      ufw_ok="yes"
+    fi
+  fi
+
+  echo "请选择："
+  echo "  1) iptables-multiport（推荐默认，适用最广）"
+  if [[ "$ufw_ok" == "yes" ]]; then
+    echo "  2) ufw（检测到 ufw 为 active，可用）"
+  else
+    echo "  2) ufw（未检测到 ufw active，不推荐/可能无效）"
+  fi
+  echo "  0) 返回"
+  read -r -p "请选择: " c
+
+  local banaction="$cur"
+  case "$c" in
+    1) banaction="iptables-multiport" ;;
+    2) banaction="ufw" ;;
+    0) return 0 ;;
+    *) warn "无效选择"; read -r -p "回车继续..." _; return 0 ;;
+  esac
+
+  # 写回配置（沿用其它参数）
+  local port backend logpath maxretry findtime bantime ignoreip
+  port="$(f2b_get_managed_value "port" "$(get_current_port)")"
+  backend="$(f2b_get_managed_value "backend" "auto")"
+  logpath="$(f2b_get_managed_value "logpath" "/var/log/auth.log")"
+  maxretry="$(f2b_get_managed_value "maxretry" "5")"
+  findtime="$(f2b_get_managed_value "findtime" "10m")"
+  bantime="$(f2b_get_managed_value "bantime" "1h")"
+  ignoreip="$(f2b_get_managed_value "ignoreip" "$(f2b_default_ignoreip)")"
+
+  f2b_write_managed_block "$port" "$backend" "$logpath" "$maxretry" "$findtime" "$bantime" "$ignoreip" "$banaction"
+  f2b_restart_and_show
+  read -r -p "回车继续..." _
+}
+
+# ---- 12) Fail2ban 子菜单入口（8 选项）----
+fail2ban_menu() {
+  while true; do
+    echo
+    hr
+    echo "${CBOLD}${CCYA}Fail2ban（一键安装/修复/配置/排障）${C0}"
+    echo "${CBOLD}${CCYA}============================================================${C0}"
+    echo "  1) 一键安装/修复/启动（推荐）"
+    echo "  2) 查看状态（service + jail）"
+    echo "  3) 查看当前配置摘要（关键参数）"
+    echo "  4) 调整防爆破强度（maxretry/findtime/bantime）"
+    echo "  5) 白名单 ignoreip 管理（避免自己被误封）"
+    echo "  6) 解封 IP（unban）"
+    echo "  7) 查看被封列表 + 最近 fail2ban 日志"
+    echo "  8) 选择封禁方式 banaction（iptables / ufw）"
+    echo
+    echo "  0) 返回上级菜单"
+    echo "${CBOLD}${CCYA}============================================================${C0}"
+    read -r -p "请选择 (0-8): " c
+
+    case "$c" in
+      1) f2b_one_click_fix_start ;;
+      2) f2b_show_status ;;
+      3) f2b_show_config_summary ;;
+      4) f2b_tune_strength ;;
+      5) f2b_manage_whitelist ;;
+      6) f2b_unban_ip ;;
+      7) f2b_show_bans_and_logs ;;
+      8) f2b_switch_banaction ;;
+      0) return 0 ;;
+      *) warn "无效选择"; read -r -p "回车继续..." _ ;;
+    esac
+  done
+}
+
+# ============================================================
+# 13) 拓展口：生成未来新增工具/脚本模板文本
+# ============================================================
+
+expansion_slot_generate_template() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}拓展口：生成未来新增工具/脚本的模板文本${C0}"
+  hr
+
+  local out="/root/secure-ssh-setup_extension_template_$(date +%F_%H%M%S).txt"
+  cat > "$out" <<'EOF'
+# =========================
+# 扩展模板（把你以后要加的新功能按这个格式写）
+# =========================
+#
+# 1) 先新增一个函数：my_new_tool_menu() 或 my_new_tool_run()
+# 2) 在主菜单 [D] 工具里加一个序号入口
+# 3) 在 case "$c" 里加对应分支，调用你的函数
+# 4) 所有写文件操作都建议使用“受控区块”（BEGIN/END），避免覆盖用户手动配置
+#
+# ---- 示例 ----
+# my_new_tool_menu() {
+#   echo "这里写你的新工具逻辑"
+# }
+#
+# 在 main_menu 里加：
+#   echo " 14) 我的新工具（说明）"
+# 在 case 里加：
+#   14) my_new_tool_menu ;;
 EOF
 
-  ok "已生成扩展模板：$out"
-  echo
-  info "你可以用命令打开/编辑："
-  echo "  nano $out"
-  echo "  cat  $out"
+  ok "已生成模板：$out"
+  echo "你可以把这个文件内容复制到 ChatGPT，让我按模板帮你追加新工具。"
   read -r -p "回车继续..." _
 }
 
@@ -1006,10 +1428,11 @@ main_menu() {
         system_update_menu
         ;;
       12)
+        # 这里改成“子菜单”，你以后不用记任何命令
         fail2ban_menu
         ;;
       13)
-        extension_port_menu
+        expansion_slot_generate_template
         ;;
       0)
         exit 0
