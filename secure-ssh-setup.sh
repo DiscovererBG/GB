@@ -5,10 +5,12 @@ set -euo pipefail
 # Secure SSH Setup (Public-safe)
 # - Menu + colors
 # - One-line pubkey paste (ENTER to finish)
-# - No "server generate private key" mode (removed)
 # - Backup/validate/rollback
 # - Firewall helper (ufw/firewalld/iptables)
 # - Optional /etc/hosts fix for sudo resolve host
+# - Sudo setup helper (install sudo if missing, optional NOPASSWD, or set user password)
+# - NEW: Install UFW helper
+# - NEW: System update helper
 # =========================
 
 # ---------- colors ----------
@@ -34,7 +36,7 @@ info(){ echo "${CCYA}ℹ️  $*${C0}" >&2; }
 hr(){ printf "%s\n" "------------------------------------------------------------"; }
 
 # ---------- root check ----------
-[[ ${EUID:-0} -eq 0 ]] || die "请用 root 运行（sudo -i）"
+[[ ${EUID:-0} -eq 0 ]] || die "请用 root 运行（sudo -i / su - / 直接 root 登录）"
 
 CFG="/etc/ssh/sshd_config"
 SSHD_BIN=""
@@ -47,7 +49,7 @@ detect_sshd() {
   elif command -v sshd >/dev/null 2>&1; then
     SSHD_BIN="$(command -v sshd)"
   else
-    die "找不到 sshd。请先安装 openssh-server（Ubuntu: apt-get install -y openssh-server）"
+    die "找不到 sshd。请先安装 openssh-server（Ubuntu/Debian: apt-get install -y openssh-server）"
   fi
 }
 detect_service() {
@@ -90,7 +92,7 @@ get_current_port() {
   echo "${p:-22}"
 }
 
-# Set directive key->value, remove all existing (commented/uncommented) key lines, append one clean line.
+# Set directive key->value, remove all existing key lines (commented/uncommented), append one clean line.
 set_directive_single() {
   local key="$1" value="$2"
   local tmp
@@ -99,7 +101,6 @@ set_directive_single() {
     BEGIN{IGNORECASE=1}
     {
       line=$0
-      # remove any line starting with optional spaces, optional #, then key
       if (match(line, "^[ \t]*#?[ \t]*" k "[ \t]+")) next
       print $0
     }
@@ -113,10 +114,9 @@ set_directive_single() {
 set_allowusers() {
   local mode="$1" # add|replace
   shift
-  local want_users=("$@") # array
+  local want_users=("$@")
   [[ ${#want_users[@]} -gt 0 ]] || die "AllowUsers 用户列表不能为空"
 
-  # get existing AllowUsers (may appear multiple times) -> merge
   local existing=""
   existing="$(awk '
     BEGIN{IGNORECASE=1}
@@ -129,11 +129,9 @@ set_allowusers() {
   if [[ "$mode" == "replace" || -z "$existing" ]]; then
     merged="$(printf "%s " "${want_users[@]}" | xargs)"
   else
-    # add mode: union (preserve existing + add new unique)
     local all=()
     # shellcheck disable=SC2206
     all=($existing "${want_users[@]}")
-    # unique
     local uniq=()
     local u
     for u in "${all[@]}"; do
@@ -145,12 +143,106 @@ set_allowusers() {
     merged="$(printf "%s " "${uniq[@]}" | xargs)"
   fi
 
-  # remove all AllowUsers lines, append single
   set_directive_single "AllowUsers" "$merged"
 }
 
 valid_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]; }
 valid_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1<=10#$1 && 10#$1<=65535 )); }
+
+# ---------- sudo + user password helpers ----------
+ensure_sudo_installed() {
+  if command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "检测到系统未安装 sudo，正在尝试安装…"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y sudo || die "sudo 安装失败（apt-get）。请先修复系统包管理（例如 dpkg/apt 错误）"
+    ok "已安装 sudo"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y sudo || die "sudo 安装失败（yum）"
+    ok "已安装 sudo"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y sudo || die "sudo 安装失败（dnf）"
+    ok "已安装 sudo"
+  else
+    warn "无法自动安装 sudo（未识别包管理器）。你需要手动安装 sudo。"
+    return 1
+  fi
+}
+
+user_has_usable_password() {
+  local u="$1"
+  if passwd -S "$u" >/dev/null 2>&1; then
+    local st
+    st="$(passwd -S "$u" 2>/dev/null | awk '{print $2}' || true)"
+    [[ "$st" == "P" ]] && return 0
+    return 1
+  fi
+  local hash
+  hash="$(awk -F: -v u="$u" '$1==u{print $2}' /etc/shadow 2>/dev/null || true)"
+  [[ -z "$hash" ]] && return 1
+  [[ "$hash" == "!"* || "$hash" == "*"* ]] && return 1
+  return 0
+}
+
+set_user_password_interactive() {
+  local u="$1"
+  echo
+  hr
+  echo "${CBOLD}${CBLU}给用户【$u】设置系统密码（用于 sudo 验证）${C0}"
+  echo "说明：这是 VPS 上该用户的系统密码，不是你本地 SSH 密钥 passphrase。"
+  echo "接下来会让你输入两次新密码（输入时不显示）。"
+  hr
+  passwd "$u"
+  ok "已为 $u 设置系统密码（sudo 会用这个密码验证）"
+}
+
+maybe_setup_sudo_for_user() {
+  local u="$1"
+
+  ensure_sudo_installed || true
+
+  if getent group sudo >/dev/null 2>&1; then
+    usermod -aG sudo "$u" || true
+    ok "已将 $u 加入 sudo 组"
+  elif getent group wheel >/dev/null 2>&1; then
+    usermod -aG wheel "$u" || true
+    ok "已将 $u 加入 wheel 组"
+  else
+    warn "系统未找到 sudo/wheel 组，将使用 /etc/sudoers.d 授权"
+    echo "$u ALL=(ALL) ALL" > "/etc/sudoers.d/$u"
+    chmod 440 "/etc/sudoers.d/$u"
+    ok "已写入 /etc/sudoers.d/$u（sudo 默认需要该用户密码）"
+  fi
+
+  echo
+  echo "${CBOLD}${CBLU}sudo 验证方式（给用户 $u）${C0}"
+  echo "  1) sudo 需要输入 $u 的系统密码（推荐）"
+  echo "  2) sudo 免密（NOPASSWD，更方便但安全性略降）"
+  read -r -p "请选择 (1/2) [默认 1]: " m
+  m="${m:-1}"
+
+  if [[ "$m" == "2" ]]; then
+    echo "$u ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$u"
+    chmod 440 "/etc/sudoers.d/$u"
+    ok "已设置：$u sudo 免密（/etc/sudoers.d/$u）"
+  else
+    if ! user_has_usable_password "$u"; then
+      warn "检测到 $u 目前没有可用系统密码（未设置或锁定）"
+      read -r -p "现在就为 $u 设置系统密码吗？(yes/no) [默认 yes]: " yn
+      yn="${yn:-yes}"
+      if [[ "$yn" == "yes" ]]; then
+        set_user_password_interactive "$u"
+      else
+        warn "你选择不设置密码：如果 $u 仍无密码，后续 sudo 会一直失败。"
+      fi
+    else
+      ok "检测到 $u 已有系统密码（sudo 可用）"
+    fi
+  fi
+}
 
 ensure_user() {
   local u="$1"
@@ -161,11 +253,7 @@ ensure_user() {
     ok "已创建用户：$u"
   fi
 
-  # Ubuntu/Debian: sudo group
-  if getent group sudo >/dev/null 2>&1; then
-    usermod -aG sudo "$u" || true
-    ok "已将 $u 加入 sudo 组（默认 sudo 仍需输入密码）"
-  fi
+  maybe_setup_sudo_for_user "$u"
 
   install -d -m 700 -o "$u" -g "$u" "/home/$u/.ssh"
   touch "/home/$u/.ssh/authorized_keys"
@@ -186,9 +274,7 @@ install_pubkey_one_line() {
   hr
   read -r pub
 
-  # trim
   pub="$(echo "$pub" | sed -e 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
-
   [[ -n "$pub" ]] || die "公钥不能为空"
   echo "$pub" | grep -qE '^ssh-(ed25519|rsa)[[:space:]]' || die "公钥格式不对（应以 ssh-ed25519 或 ssh-rsa 开头）"
 
@@ -229,7 +315,7 @@ harden_ssh() {
   local disable_pass="$2"    # yes/no
   local allowusers_mode="$3" # off/add/replace
   shift 3
-  local allow_users_list=("$@") # may be empty if off
+  local allow_users_list=("$@")
 
   local bk
   bk="$(backup_cfg)"
@@ -238,7 +324,6 @@ harden_ssh() {
   set_directive_single "PermitRootLogin" "no"
   set_directive_single "PubkeyAuthentication" "yes"
 
-  # only change password auth if requested
   if [[ "$disable_pass" == "yes" ]]; then
     set_directive_single "PasswordAuthentication" "no"
   fi
@@ -253,9 +338,7 @@ harden_ssh() {
 
   local msg="加固完成：禁 root SSH + 公钥认证已启用"
   [[ "$disable_pass" == "yes" ]] && msg="$msg + 已禁用密码登录"
-  if [[ "$allowusers_mode" != "off" ]]; then
-    msg="$msg + AllowUsers(${allowusers_mode})"
-  fi
+  [[ "$allowusers_mode" != "off" ]] && msg="$msg + AllowUsers(${allowusers_mode})"
   ok "$msg"
 }
 
@@ -284,7 +367,6 @@ firewall_allow_port() {
       ok "已执行：firewalld 放行 ${p}/tcp"
       ;;
     iptables)
-      # try nft backend too; do minimal, idempotent-ish
       iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
       ok "已执行：iptables 放行 ${p}/tcp（注意：重启可能丢失，需你自行持久化）"
       ;;
@@ -313,7 +395,6 @@ firewall_close_port() {
       ok "已尝试：firewalld 移除 ${p}/tcp"
       ;;
     iptables)
-      # remove first matching rule
       local line
       line="$(iptables -L INPUT -n --line-numbers | awk -v p="$p" '$0~"tcp" && $0~("dpt:"p){print $1; exit}' || true)"
       if [[ -n "$line" ]]; then
@@ -327,6 +408,82 @@ firewall_close_port() {
       warn "未检测到本机防火墙工具。关闭端口请到云厂商安全组操作。"
       ;;
   esac
+}
+
+# ---------- UFW installer ----------
+install_ufw_menu() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}安装/启用 UFW（会自动放行当前 SSH 端口）${C0}"
+  hr
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "当前脚本仅对 Debian/Ubuntu 的 apt 安装 UFW 做了自动化。"
+    warn "你的系统不是 apt 系，建议手动安装 ufw 或使用 firewalld。"
+    read -r -p "回车继续..." _
+    return 0
+  fi
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    info "开始安装 ufw…"
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ufw || die "ufw 安装失败（apt）"
+    ok "ufw 已安装"
+  else
+    ok "ufw 已安装"
+  fi
+
+  local p
+  p="$(get_current_port)"
+  info "将放行当前 SSH 端口：${p}/tcp"
+  ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+
+  echo
+  echo "是否启用 UFW？"
+  echo "  - 启用后：默认会阻止未允许的入站"
+  echo "  - 注意：云安全组也必须放行 SSH 端口"
+  read -r -p "输入 YES 启用（其它跳过）: " ans
+  if [[ "$ans" == "YES" ]]; then
+    ufw --force enable || true
+    ok "UFW 已启用"
+    ufw status verbose || true
+  else
+    warn "已跳过启用（仅安装/放行规则已写入）"
+  fi
+
+  read -r -p "回车继续..." _
+}
+
+# ---------- system update ----------
+system_update_menu() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}更新当前系统（自动识别 apt/yum/dnf）${C0}"
+  hr
+  warn "提示：更新可能耗时；过程中不要断开 SSH。"
+
+  read -r -p "确认要更新？输入 YES 开始: " ans
+  [[ "$ans" == "YES" ]] || { warn "已取消更新"; read -r -p "回车继续..." _; return 0; }
+
+  if command -v apt-get >/dev/null 2>&1; then
+    info "执行：apt-get update && apt-get upgrade -y"
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
+    ok "apt 更新完成（如有内核更新，建议后续择机重启）"
+  elif command -v dnf >/dev/null 2>&1; then
+    info "执行：dnf upgrade -y"
+    dnf upgrade -y || true
+    ok "dnf 更新完成"
+  elif command -v yum >/dev/null 2>&1; then
+    info "执行：yum update -y"
+    yum update -y || true
+    ok "yum 更新完成"
+  else
+    warn "未识别系统包管理器（apt/yum/dnf）。请手动更新。"
+  fi
+
+  read -r -p "回车继续..." _
 }
 
 # ---------- status ----------
@@ -437,9 +594,13 @@ main_menu() {
     echo "  7) 修复 /etc/hosts（解决 sudo: unable to resolve host，可选）"
     echo "  8) 回滚 sshd_config 备份"
     echo
+    echo "${CBOLD}${CBLU}[D] 工具（新增）${C0}"
+    echo "  9) 安装/启用 UFW（自动放行当前 SSH 端口）"
+    echo " 10) 更新当前系统（apt/yum/dnf 自动识别）"
+    echo
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
-    read -r -p "请选择 (0-8): " c
+    read -r -p "请选择 (0-10): " c
 
     case "$c" in
       1)
@@ -461,6 +622,7 @@ main_menu() {
         read -r -p "输入新 SSH 端口（1-65535）: " new_port
         valid_port "$new_port" || die "端口不合法"
         set_ssh_port "$new_port"
+
         echo
         hr
         echo "${CBOLD}${CYEL}重要：请不要关闭当前会话！${C0}"
@@ -500,7 +662,6 @@ main_menu() {
         read -r -p "输入 I_CAN_LOGIN_WITH_KEY 才继续: " confirm
         [[ "$confirm" == "I_CAN_LOGIN_WITH_KEY" ]] || { warn "未确认，已取消加固"; read -r -p "回车继续..." _; continue; }
 
-        # password disable default decision
         local disable_pass_default="no"
         authorized_keys_has_key "$target_user" && disable_pass_default="yes"
 
@@ -509,7 +670,6 @@ main_menu() {
         disable_pass="${disable_pass:-$disable_pass_default}"
         [[ "$disable_pass" == "yes" || "$disable_pass" == "no" ]] || die "输入必须是 yes 或 no"
 
-        # AllowUsers options
         echo
         echo "${CBOLD}${CBLU}AllowUsers（可选）${C0}"
         echo "  0) 不启用（推荐默认）"
@@ -559,6 +719,12 @@ main_menu() {
       8)
         rollback_menu
         read -r -p "回车继续..." _
+        ;;
+      9)
+        install_ufw_menu
+        ;;
+      10)
+        system_update_menu
         ;;
       0)
         exit 0
