@@ -12,6 +12,7 @@ set -euo pipefail
 # - NEW: Install UFW helper
 # - NEW: System update helper
 # - NEW: Show firewall allowed rules/ports + offer to enable if inactive (UFW)
+# - NEW: Fail2ban menu (install/config/status/unban)
 # =========================
 
 # ---------- colors ----------
@@ -411,7 +412,7 @@ firewall_close_port() {
   esac
 }
 
-# ---------- NEW: show allowed rules/ports + offer enable if inactive ----------
+# ---------- Show allowed rules/ports + offer enable if inactive ----------
 firewall_show_rules_menu() {
   echo
   hr
@@ -598,7 +599,7 @@ warn_hosts_if_needed() {
   hn="$(hostname)"
   if ! grep -qE "^[[:space:]]*127\.0\.1\.1[[:space:]]+$hn(\b|$)" /etc/hosts 2>/dev/null; then
     warn "检测到 /etc/hosts 可能缺少 127.0.1.1 hostname 映射（可能出现 sudo: unable to resolve host）"
-    info "建议菜单里选择：7) 修复 /etc/hosts（可选）"
+    info "建议菜单里选择：8) 修复 /etc/hosts（可选）"
   fi
 }
 
@@ -634,6 +635,192 @@ rollback_menu() {
   sshd_test || { warn "回滚后 sshd -t 仍失败，请检查：$chosen"; return 1; }
   restart_ssh
   ok "已回滚到：$chosen 并重启 SSH 服务"
+}
+
+# =========================
+# NEW: Fail2ban menu
+# =========================
+fail2ban_install() {
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    ok "Fail2ban 已安装"
+    return 0
+  fi
+
+  info "开始安装 Fail2ban…"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || die "Fail2ban 安装失败（apt）"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y fail2ban || die "Fail2ban 安装失败（dnf）"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y fail2ban || die "Fail2ban 安装失败（yum）"
+  else
+    die "未识别包管理器（apt/yum/dnf），请手动安装 fail2ban"
+  fi
+  ok "Fail2ban 已安装"
+}
+
+fail2ban_enable_now() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  else
+    service fail2ban start >/dev/null 2>&1 || true
+  fi
+  ok "Fail2ban 已启用/已启动"
+}
+
+fail2ban_write_jail_local() {
+  local ssh_port
+  ssh_port="$(get_current_port)"
+
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban - 生成 sshd 防爆破配置（/etc/fail2ban/jail.local）${C0}"
+  hr
+  echo "默认策略：10分钟内失败 5 次就封，封 1 小时"
+  echo "你的当前 SSH 端口：${ssh_port}"
+  echo
+  echo "端口写法："
+  echo "  1) port = ssh   （推荐，通常会自动识别 sshd 实际端口）"
+  echo "  2) port = ${ssh_port} （更硬核，固定写死当前端口）"
+  read -r -p "选择 (1/2) [默认 1]: " mode
+  mode="${mode:-1}"
+
+  local port_line="port = ssh"
+  if [[ "$mode" == "2" ]]; then
+    port_line="port = ${ssh_port}"
+  fi
+
+  # 白名单（可选）
+  echo
+  echo "是否设置 ignoreip 白名单？（推荐填你家宽公网IP，避免误封自己）"
+  echo "示例：1.2.3.4 或 1.2.3.0/24"
+  read -r -p "输入你的白名单 IP/CIDR（留空跳过）: " wl
+
+  local ignore_line="# ignoreip = 127.0.0.1/8 ::1"
+  if [[ -n "${wl:-}" ]]; then
+    ignore_line="ignoreip = 127.0.0.1/8 ::1 ${wl}"
+  fi
+
+  cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+${ignore_line}
+
+[sshd]
+enabled = true
+backend = systemd
+${port_line}
+EOF
+
+  ok "已写入 /etc/fail2ban/jail.local"
+}
+
+fail2ban_restart() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+  else
+    service fail2ban restart >/dev/null 2>&1 || true
+  fi
+  ok "Fail2ban 已重启"
+}
+
+fail2ban_status_show() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban 状态${C0}"
+  hr
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "${CCYA}ℹ️  service 状态：${C0}"
+    systemctl status fail2ban --no-pager 2>/dev/null || true
+  else
+    echo "${CCYA}ℹ️  service 状态：${C0}"
+    service fail2ban status 2>/dev/null || true
+  fi
+
+  echo
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    echo "${CCYA}ℹ️  fail2ban-client status：${C0}"
+    fail2ban-client status 2>/dev/null || true
+    echo
+    echo "${CCYA}ℹ️  sshd jail：${C0}"
+    fail2ban-client status sshd 2>/dev/null || true
+  else
+    warn "fail2ban-client 不存在（可能未安装）"
+  fi
+}
+
+fail2ban_unban_ip() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}Fail2ban 解封 IP（sshd jail）${C0}"
+  hr
+  read -r -p "输入要解封的 IP（例如 1.2.3.4）: " ip
+  [[ -n "${ip:-}" ]] || { warn "IP 不能为空"; return 0; }
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    warn "fail2ban-client 不存在，请先安装"
+    return 0
+  fi
+  fail2ban-client set sshd unbanip "$ip" 2>/dev/null || true
+  ok "已尝试解封：$ip（如果之前未封禁，会提示无影响）"
+}
+
+fail2ban_uninstall() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}卸载 Fail2ban（可选）${C0}"
+  hr
+  warn "一般不建议卸载，除非你确定不用。"
+  read -r -p "输入 YES 才卸载: " ans
+  [[ "$ans" == "YES" ]] || { warn "已取消"; return 0; }
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get remove -y fail2ban || true
+    apt-get autoremove -y || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf remove -y fail2ban || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum remove -y fail2ban || true
+  else
+    warn "未识别包管理器，无法自动卸载"
+    return 0
+  fi
+  ok "Fail2ban 已尝试卸载"
+}
+
+fail2ban_menu() {
+  while true; do
+    echo
+    hr
+    echo "${CBOLD}${CCYA}================= Fail2ban（防爆破）菜单 =================${C0}"
+    echo "当前 SSH 端口: ${CBOLD}$(get_current_port)${C0}"
+    echo "${CBOLD}${CCYA}=========================================================${C0}"
+    echo "  1) 安装 Fail2ban"
+    echo "  2) 启用/启动 Fail2ban（systemctl enable --now）"
+    echo "  3) 生成/覆盖 jail.local（启用 sshd 防爆破）"
+    echo "  4) 重启 Fail2ban（使配置生效）"
+    echo "  5) 查看状态（含 sshd jail）"
+    echo "  6) 解封 IP（sshd jail）"
+    echo "  7) 卸载 Fail2ban（可选）"
+    echo "  0) 返回上级菜单"
+    hr
+    read -r -p "请选择 (0-7): " x
+
+    case "$x" in
+      1) fail2ban_install; read -r -p "回车继续..." _ ;;
+      2) fail2ban_enable_now; read -r -p "回车继续..." _ ;;
+      3) fail2ban_install; fail2ban_enable_now; fail2ban_write_jail_local; read -r -p "回车继续..." _ ;;
+      4) fail2ban_restart; read -r -p "回车继续..." _ ;;
+      5) fail2ban_status_show; read -r -p "回车继续..." _ ;;
+      6) fail2ban_unban_ip; read -r -p "回车继续..." _ ;;
+      7) fail2ban_uninstall; read -r -p "回车继续..." _ ;;
+      0) return 0 ;;
+      *) warn "无效选择"; read -r -p "回车继续..." _ ;;
+    esac
+  done
 }
 
 # ---------- menu ----------
@@ -672,10 +859,11 @@ main_menu() {
     echo "${CBOLD}${CBLU}[D] 工具（新增）${C0}"
     echo " 10) 安装/启用 UFW（自动放行当前 SSH 端口）"
     echo " 11) 更新当前系统（apt/yum/dnf 自动识别）"
+    echo " 12) Fail2ban（防爆破）"
     echo
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
-    read -r -p "请选择 (0-11): " c
+    read -r -p "请选择 (0-12): " c
 
     case "$c" in
       1)
@@ -803,6 +991,9 @@ main_menu() {
         ;;
       11)
         system_update_menu
+        ;;
+      12)
+        fail2ban_menu
         ;;
       0)
         exit 0
