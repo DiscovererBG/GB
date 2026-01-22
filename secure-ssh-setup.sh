@@ -11,7 +11,7 @@ set -euo pipefail
 # - Sudo setup helper (install sudo if missing, optional NOPASSWD, or set user password)
 # - NEW: Install UFW helper
 # - NEW: System update helper
-# - NEW: Show allowed ports/rules (ufw/firewalld/iptables)
+# - NEW: Show firewall allowed rules/ports + offer to enable if inactive (UFW)
 # =========================
 
 # ---------- colors ----------
@@ -411,7 +411,7 @@ firewall_close_port() {
   esac
 }
 
-# ---------- NEW: show allowed ports/rules ----------
+# ---------- NEW: show allowed rules/ports + offer enable if inactive ----------
 firewall_show_rules_menu() {
   echo
   hr
@@ -420,53 +420,62 @@ firewall_show_rules_menu() {
 
   local fw
   fw="$(detect_firewall)"
-  echo "检测到防火墙: ${CBOLD}${fw}${C0}"
+  echo "检测到防火墙: $fw"
   echo
 
   case "$fw" in
     ufw)
-      info "UFW 规则（含已放行端口）："
-      ufw status numbered verbose || ufw status verbose || true
+      if ! command -v ufw >/dev/null 2>&1; then
+        warn "未安装 ufw"
+        read -r -p "回车继续..." _
+        return 0
+      fi
+
+      local st
+      st="$(ufw status 2>/dev/null | head -n1 || true)"
+      echo "${CCYA}ℹ️  UFW 状态：${C0}${st}"
+      echo
+
+      if echo "$st" | grep -qi "inactive"; then
+        warn "UFW 当前未启用（inactive）"
+        echo "你可以选择现在启用（会自动放行当前 SSH 端口：$(get_current_port)/tcp）"
+        read -r -p "输入 YES 立即启用 UFW（其它跳过）: " ans
+        if [[ "$ans" == "YES" ]]; then
+          local p
+          p="$(get_current_port)"
+          info "放行当前 SSH 端口：${p}/tcp"
+          ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+          ufw default deny incoming >/dev/null 2>&1 || true
+          ufw default allow outgoing >/dev/null 2>&1 || true
+          ufw --force enable >/dev/null 2>&1 || true
+          ok "UFW 已启用"
+          echo
+        fi
+      fi
+
+      echo "${CCYA}ℹ️  UFW 规则（含已放行端口）：${C0}"
+      ufw status numbered 2>/dev/null || ufw status verbose 2>/dev/null || true
+
+      echo
+      echo "${CCYA}ℹ️  已添加但未必启用的规则（show added）：${C0}"
+      ufw show added 2>/dev/null || true
       ;;
     firewalld)
-      info "Firewalld 活动区域："
-      firewall-cmd --get-active-zones || true
+      echo "${CCYA}ℹ️  firewalld 状态：${C0}"
+      systemctl is-active firewalld 2>/dev/null || true
       echo
-      # 展示每个 active zone 的端口/服务/富规则
-      local zones
-      zones="$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NR%2==1{print $1}' || true)"
-      if [[ -n "${zones:-}" ]]; then
-        local z
-        for z in $zones; do
-          echo "${CBOLD}--- zone: ${z} ---${C0}"
-          echo "ports    : $(firewall-cmd --zone="$z" --list-ports 2>/dev/null || echo "")"
-          echo "services : $(firewall-cmd --zone="$z" --list-services 2>/dev/null || echo "")"
-          echo "rich-rules:"
-          firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null || true
-          echo
-        done
-      else
-        warn "未能获取 active zones（可能 firewalld 未运行）。你也可以手动：firewall-cmd --state"
-      fi
+      echo "${CCYA}ℹ️  开放端口：${C0}"
+      firewall-cmd --list-ports 2>/dev/null || true
+      echo
+      echo "${CCYA}ℹ️  详细规则：${C0}"
+      firewall-cmd --list-all 2>/dev/null || true
       ;;
     iptables)
-      info "iptables 规则（IPv4）："
-      iptables -S || true
-      echo
-      info "iptables 当前链（带行号，便于定位端口）："
-      iptables -L -n --line-numbers || true
-      echo
-      if command -v ip6tables >/dev/null 2>&1; then
-        info "ip6tables 规则（IPv6）："
-        ip6tables -S || true
-        echo
-        ip6tables -L -n --line-numbers || true
-      fi
-      warn "注意：iptables 规则是否持久化取决于系统（重启可能丢失）。"
+      echo "${CCYA}ℹ️  iptables INPUT（含行号）：${C0}"
+      iptables -L INPUT -n --line-numbers 2>/dev/null || true
       ;;
     none)
-      warn "本机未检测到 ufw/firewalld/iptables。"
-      warn "如果你是在云服务器上：通常主要靠【云安全组】放行端口。"
+      warn "未检测到 ufw/firewalld/iptables。请到云厂商安全组/防火墙查看放行端口。"
       ;;
   esac
 
@@ -652,17 +661,17 @@ main_menu() {
     echo "  2) 更改 SSH 端口（备份/校验/可回滚）"
     echo "  3) 放行端口（自动检测 ufw/firewalld/iptables）"
     echo "  4) 关闭端口（自动检测 ufw/firewalld/iptables）"
-    echo " 11) 查看已放行端口/规则（ufw/firewalld/iptables）"
+    echo "  5) 查看已放行端口/规则（ufw/firewalld/iptables）"
     echo
     echo "${CBOLD}${CBLU}[C] 加固与维护${C0}"
-    echo "  5) 加固：禁 root SSH + 可选禁密码 + 可选 AllowUsers（防锁外确认）"
-    echo "  6) 查看 SSH/配置状态"
-    echo "  7) 修复 /etc/hosts（解决 sudo: unable to resolve host，可选）"
-    echo "  8) 回滚 sshd_config 备份"
+    echo "  6) 加固：禁 root SSH + 可选禁密码 + 可选 AllowUsers（防锁外确认）"
+    echo "  7) 查看 SSH/配置状态"
+    echo "  8) 修复 /etc/hosts（解决 sudo: unable to resolve host，可选）"
+    echo "  9) 回滚 sshd_config 备份"
     echo
     echo "${CBOLD}${CBLU}[D] 工具（新增）${C0}"
-    echo "  9) 安装/启用 UFW（自动放行当前 SSH 端口）"
-    echo " 10) 更新当前系统（apt/yum/dnf 自动识别）"
+    echo " 10) 安装/启用 UFW（自动放行当前 SSH 端口）"
+    echo " 11) 更新当前系统（apt/yum/dnf 自动识别）"
     echo
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
@@ -711,6 +720,9 @@ main_menu() {
         read -r -p "回车继续..." _
         ;;
       5)
+        firewall_show_rules_menu
+        ;;
+      6)
         [[ -n "$target_user" ]] || read -r -p "输入要加固关联的目标用户名（例如 bgbg）: " target_user
         valid_username "$target_user" || die "用户名不合法"
 
@@ -774,26 +786,23 @@ main_menu() {
         hr
         read -r -p "回车继续..." _
         ;;
-      6)
+      7)
         show_status
         read -r -p "回车继续..." _
         ;;
-      7)
+      8)
         fix_hosts
         read -r -p "回车继续..." _
         ;;
-      8)
+      9)
         rollback_menu
         read -r -p "回车继续..." _
         ;;
-      9)
+      10)
         install_ufw_menu
         ;;
-      10)
-        system_update_menu
-        ;;
       11)
-        firewall_show_rules_menu
+        system_update_menu
         ;;
       0)
         exit 0
