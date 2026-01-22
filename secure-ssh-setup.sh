@@ -11,6 +11,7 @@ set -euo pipefail
 # - Sudo setup helper (install sudo if missing, optional NOPASSWD, or set user password)
 # - NEW: Install UFW helper
 # - NEW: System update helper
+# - NEW: Show allowed ports/rules (ufw/firewalld/iptables)
 # =========================
 
 # ---------- colors ----------
@@ -410,6 +411,70 @@ firewall_close_port() {
   esac
 }
 
+# ---------- NEW: show allowed ports/rules ----------
+firewall_show_rules_menu() {
+  echo
+  hr
+  echo "${CBOLD}${CBLU}查看已放行端口/规则（ufw/firewalld/iptables）${C0}"
+  hr
+
+  local fw
+  fw="$(detect_firewall)"
+  echo "检测到防火墙: ${CBOLD}${fw}${C0}"
+  echo
+
+  case "$fw" in
+    ufw)
+      info "UFW 规则（含已放行端口）："
+      ufw status numbered verbose || ufw status verbose || true
+      ;;
+    firewalld)
+      info "Firewalld 活动区域："
+      firewall-cmd --get-active-zones || true
+      echo
+      # 展示每个 active zone 的端口/服务/富规则
+      local zones
+      zones="$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NR%2==1{print $1}' || true)"
+      if [[ -n "${zones:-}" ]]; then
+        local z
+        for z in $zones; do
+          echo "${CBOLD}--- zone: ${z} ---${C0}"
+          echo "ports    : $(firewall-cmd --zone="$z" --list-ports 2>/dev/null || echo "")"
+          echo "services : $(firewall-cmd --zone="$z" --list-services 2>/dev/null || echo "")"
+          echo "rich-rules:"
+          firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null || true
+          echo
+        done
+      else
+        warn "未能获取 active zones（可能 firewalld 未运行）。你也可以手动：firewall-cmd --state"
+      fi
+      ;;
+    iptables)
+      info "iptables 规则（IPv4）："
+      iptables -S || true
+      echo
+      info "iptables 当前链（带行号，便于定位端口）："
+      iptables -L -n --line-numbers || true
+      echo
+      if command -v ip6tables >/dev/null 2>&1; then
+        info "ip6tables 规则（IPv6）："
+        ip6tables -S || true
+        echo
+        ip6tables -L -n --line-numbers || true
+      fi
+      warn "注意：iptables 规则是否持久化取决于系统（重启可能丢失）。"
+      ;;
+    none)
+      warn "本机未检测到 ufw/firewalld/iptables。"
+      warn "如果你是在云服务器上：通常主要靠【云安全组】放行端口。"
+      ;;
+  esac
+
+  echo
+  warn "重要：即使本机已放行，云厂商安全组/防火墙也必须放行对应端口。"
+  read -r -p "回车继续..." _
+}
+
 # ---------- UFW installer ----------
 install_ufw_menu() {
   echo
@@ -587,6 +652,7 @@ main_menu() {
     echo "  2) 更改 SSH 端口（备份/校验/可回滚）"
     echo "  3) 放行端口（自动检测 ufw/firewalld/iptables）"
     echo "  4) 关闭端口（自动检测 ufw/firewalld/iptables）"
+    echo " 11) 查看已放行端口/规则（ufw/firewalld/iptables）"
     echo
     echo "${CBOLD}${CBLU}[C] 加固与维护${C0}"
     echo "  5) 加固：禁 root SSH + 可选禁密码 + 可选 AllowUsers（防锁外确认）"
@@ -600,7 +666,7 @@ main_menu() {
     echo
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
-    read -r -p "请选择 (0-10): " c
+    read -r -p "请选择 (0-11): " c
 
     case "$c" in
       1)
@@ -725,6 +791,9 @@ main_menu() {
         ;;
       10)
         system_update_menu
+        ;;
+      11)
+        firewall_show_rules_menu
         ;;
       0)
         exit 0
