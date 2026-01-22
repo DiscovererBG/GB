@@ -1,4 +1,3 @@
-cat > /root/secure-ssh-allinone.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -12,40 +11,73 @@ CFG="/etc/ssh/sshd_config"
 SSHD_BIN=""
 SERVICE_NAME="ssh"
 
+# -------- core detect --------
 detect_sshd() {
-  if [[ -x /usr/sbin/sshd ]]; then SSHD_BIN="/usr/sbin/sshd"
-  elif command -v sshd >/dev/null 2>&1; then SSHD_BIN="$(command -v sshd)"
-  else die "找不到 sshd，请先安装 openssh-server"; fi
+  if [[ -x /usr/sbin/sshd ]]; then
+    SSHD_BIN="/usr/sbin/sshd"
+  elif command -v sshd >/dev/null 2>&1; then
+    SSHD_BIN="$(command -v sshd)"
+  else
+    die "找不到 sshd，请先安装 openssh-server"
+  fi
 }
+
 detect_service() {
-  if systemctl list-unit-files | grep -qE '^ssh\.service'; then SERVICE_NAME="ssh"
-  elif systemctl list-unit-files | grep -qE '^sshd\.service'; then SERVICE_NAME="sshd"
-  else SERVICE_NAME="ssh"; fi
+  if systemctl list-unit-files | grep -qE '^ssh\.service'; then
+    SERVICE_NAME="ssh"
+  elif systemctl list-unit-files | grep -qE '^sshd\.service'; then
+    SERVICE_NAME="sshd"
+  else
+    SERVICE_NAME="ssh"
+  fi
 }
+
 restart_ssh() {
-  systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  systemctl restart "$SERVICE_NAME" 2>/dev/null \
+    || systemctl restart ssh 2>/dev/null \
+    || systemctl restart sshd 2>/dev/null \
+    || true
 }
+
 sshd_test() { "$SSHD_BIN" -t; }
 
+# -------- helpers --------
 get_current_port() {
   local p
   p="$(awk 'tolower($1)=="port"{print $2}' "$CFG" | tail -n1 || true)"
   echo "${p:-22}"
 }
+
 backup_cfg() {
   local bk="${CFG}.bak.$(date +%F_%H%M%S)"
   cp "$CFG" "$bk"
   echo "$bk"
 }
 
-valid_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]; }
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1>=1 && $1<=65535 )); }
+valid_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]; }
+valid_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1<=10#$1 && 10#$1<=65535 )); }
+
+maybe_fix_hostname() {
+  # 可选：修复 sudo: unable to resolve host
+  # 只提示，不强改（避免改错）
+  local hn
+  hn="$(hostname)"
+  if ! grep -qE "^[[:space:]]*127\.0\.1\.1[[:space:]]+$hn(\b|$)" /etc/hosts 2>/dev/null; then
+    warn "检测到 /etc/hosts 可能缺少 127.0.1.1 hostname 映射（可能会出现 sudo: unable to resolve host）"
+    warn "可选修复：echo \"127.0.1.1 $hn\" >> /etc/hosts"
+  fi
+}
 
 ensure_user() {
   local u="$1"
-  if id -u "$u" >/dev/null 2>&1; then ok "用户已存在：$u"
-  else adduser --disabled-password --gecos "" "$u"; ok "已创建用户：$u"; fi
+  if id -u "$u" >/dev/null 2>&1; then
+    ok "用户已存在：$u"
+  else
+    adduser --disabled-password --gecos "" "$u"
+    ok "已创建用户：$u"
+  fi
 
+  # Ubuntu/Debian：sudo 组
   if getent group sudo >/dev/null 2>&1; then
     usermod -aG sudo "$u" || true
     ok "已将 $u 加入 sudo 组（默认 sudo 仍需输入密码）"
@@ -71,14 +103,14 @@ install_pubkey_by_paste() {
   [[ -s "$tmp" ]] || die "未检测到公钥内容"
   grep -qE '^ssh-(ed25519|rsa)[[:space:]]' "$tmp" || die "公钥格式不对（应以 ssh-ed25519 或 ssh-rsa 开头）"
 
-  # 去重写入
   local pub
-  pub="$(cat "$tmp" | tr -d '\r' | head -n1)"
+  pub="$(tr -d '\r' < "$tmp" | head -n1)"
+
   if grep -qxF "$pub" "/home/$u/.ssh/authorized_keys"; then
     ok "公钥已存在，跳过写入"
   else
     echo "$pub" >> "/home/$u/.ssh/authorized_keys"
-    ok "公钥已写入 /home/$u/.ssh/authorized_keys"
+    ok "公钥已写入：/home/$u/.ssh/authorized_keys"
   fi
   rm -f "$tmp"
 }
@@ -96,7 +128,7 @@ generate_key_on_vps() {
     ssh-keygen -t ed25519 -f "$key" -N "" -C "$u@$(hostname)-generated"
     chmod 600 "$key"
     chmod 644 "$key.pub"
-    ok "已生成密钥：$key 和 $key.pub"
+    ok "已生成密钥文件：$key 与 $key.pub"
   fi
 
   local pub
@@ -105,19 +137,18 @@ generate_key_on_vps() {
     ok "authorized_keys 已包含该公钥"
   else
     echo "$pub" >> "/home/$u/.ssh/authorized_keys"
-    ok "公钥已写入 /home/$u/.ssh/authorized_keys"
+    ok "公钥已写入：/home/$u/.ssh/authorized_keys"
   fi
 
   echo
   echo "================= 重要：请取回私钥 ================="
-  echo "私钥路径（务必下载保存好）："
+  echo "私钥路径（务必下载保存好，不要公开）："
   echo "  $key"
   echo
-  echo "你可以用 scp 把私钥下载到本地："
+  echo "在你本地 Mac 执行（把 <VPS_IP> 换成你的公网 IP）："
   echo "  scp -P $(get_current_port) root@<VPS_IP>:$key ~/Desktop/"
-  echo
-  echo "公钥如下（已写入 authorized_keys）："
-  echo "  $pub"
+  echo "  chmod 600 ~/Desktop/${u}_ed25519"
+  echo "  ssh -i ~/Desktop/${u}_ed25519 -p $(get_current_port) $u@<VPS_IP>"
   echo "===================================================="
 }
 
@@ -131,8 +162,8 @@ set_ssh_port() {
   bk="$(backup_cfg)"
   ok "已备份 sshd_config：$bk"
 
-  # 只保留一个 Port
-  sed -i -E '/^[[:space:]]*Port[[:space:]]+/d' "$CFG"
+  # 删除所有 Port 行，最后追加一个
+  sed -i -E '/^[[:space:]]*Port[[:space:]]+[0-9]+/d' "$CFG"
   echo "Port $new_port" >> "$CFG"
 
   sshd_test || { cp "$bk" "$CFG"; die "sshd 校验失败，已回滚：$bk"; }
@@ -141,22 +172,22 @@ set_ssh_port() {
 }
 
 harden_ssh() {
-  local disable_pass="$1"
-  local allow_users="$2"
+  local disable_pass="$1"   # yes/no
+  local allow_users="$2"    # yes/no
   local user="$3"
 
   local bk
   bk="$(backup_cfg)"
   ok "已备份 sshd_config：$bk"
 
-  # 禁 root 登录
+  # 禁 root
   if grep -qE '^[#[:space:]]*PermitRootLogin' "$CFG"; then
     sed -i -E 's/^[#[:space:]]*PermitRootLogin[[:space:]]+.*/PermitRootLogin no/' "$CFG"
   else
     echo "PermitRootLogin no" >> "$CFG"
   fi
 
-  # 公钥认证开启
+  # 开启公钥认证
   if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$CFG"; then
     sed -i -E 's/^[#[:space:]]*PubkeyAuthentication[[:space:]]+.*/PubkeyAuthentication yes/' "$CFG"
   else
@@ -172,7 +203,7 @@ harden_ssh() {
     fi
   fi
 
-  # 可选 AllowUsers
+  # 可选 AllowUsers（默认不启用，避免误锁）
   if [[ "$allow_users" == "yes" ]]; then
     if grep -qE '^[[:space:]]*AllowUsers' "$CFG"; then
       sed -i -E "s/^[[:space:]]*AllowUsers.*/AllowUsers $user/" "$CFG"
@@ -183,7 +214,7 @@ harden_ssh() {
 
   sshd_test || { cp "$bk" "$CFG"; die "sshd 校验失败，已回滚：$bk"; }
   restart_ssh
-  ok "加固完成：禁 root SSH${disable_pass:+ + 禁密码登录}${allow_users:+ + AllowUsers}"
+  ok "加固完成：禁 root SSH + $( [[ "$disable_pass" == "yes" ]] && echo "禁密码" || echo "保留密码") + $( [[ "$allow_users" == "yes" ]] && echo "AllowUsers=$user" || echo "不限制 AllowUsers")"
 }
 
 maybe_install_ufw() {
@@ -198,6 +229,7 @@ ufw_allow_port() {
   if command -v ufw >/dev/null 2>&1; then
     ufw allow "$p"/tcp || true
     ok "已尝试放行 ufw 端口：$p/tcp"
+    warn "注意：云厂商安全组也要放行 $p/tcp"
   else
     warn "未安装 ufw，已跳过（你需要在云安全组/iptables 放行端口）"
   fi
@@ -214,10 +246,11 @@ show_status() {
 main_menu() {
   detect_sshd
   detect_service
+  maybe_fix_hostname
 
   local target_user=""
   local new_port=""
-  local disable_pass="no"
+  local disable_pass="yes"
   local allow_users_only="no"
 
   while true; do
@@ -258,11 +291,12 @@ main_menu() {
         ufw_allow_port "$new_port"
         ;;
       5)
-        [[ -n "$target_user" ]] || read -r -p "输入要允许登录/加固的目标用户名（例如 bgbg）: " target_user
+        [[ -n "$target_user" ]] || read -r -p "输入要加固关联的目标用户名（例如 bgbg）: " target_user
         valid_username "$target_user" || die "用户名不合法"
 
-        read -r -p "是否禁用 SSH 密码登录？(yes/no) [建议 yes]: " disable_pass
+        read -r -p "是否禁用 SSH 密码登录？(yes/no) [默认 yes]: " disable_pass
         disable_pass="${disable_pass:-yes}"
+
         read -r -p "是否设置 AllowUsers 只允许 ${target_user} 登录？(yes/no) [默认 no]: " allow_users_only
         allow_users_only="${allow_users_only:-no}"
 
@@ -287,7 +321,3 @@ main_menu() {
 }
 
 main_menu
-EOF
-
-chmod +x /root/secure-ssh-allinone.sh
-/root/secure-ssh-allinone.sh
