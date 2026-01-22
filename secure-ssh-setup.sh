@@ -24,11 +24,10 @@ ok(){ echo "✅ $*"; }
 warn(){ echo "⚠️  $*" >&2; }
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "请用 root 运行：sudo bash vps-step1.sh 或 sudo ./vps-step1.sh"
+  [[ "${EUID}" -eq 0 ]] || die "请用 root 运行：sudo bash secure-ssh-setup.sh 或 sudo ./secure-ssh-setup.sh"
 }
 
 valid_username() {
-  # safe-ish linux username: starts with lowercase letter/_ then letters/digits/_/-
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
 }
 
@@ -83,7 +82,6 @@ prepare_user_and_ssh() {
     ok "已创建用户：$user"
   fi
 
-  # prepare ssh dir
   install -d -m 700 -o "$user" -g "$user" "/home/$user/.ssh"
   touch "/home/$user/.ssh/authorized_keys"
   chmod 600 "/home/$user/.ssh/authorized_keys"
@@ -138,11 +136,9 @@ maybe_change_port() {
   bk="$(backup_file "$cfg")"
   ok "已备份 sshd_config：$bk"
 
-  # Remove existing Port directives, append the new one
   sed -i -E '/^[[:space:]]*Port[[:space:]]+/d' "$cfg"
   echo "Port $new_port" >> "$cfg"
 
-  # Validate & rollback if fail
   if ! "$sshd_bin" -t; then
     cp "$bk" "$cfg"
     die "sshd 配置校验失败，已回滚到备份：$bk"
@@ -166,15 +162,15 @@ print_next_steps() {
   echo "2) 查看公钥并复制："
   echo "   cat ~/.ssh/id_ed25519.pub"
   echo
-  echo "3) 把公钥写入 VPS（你可以用我们的 Mac-Step2 脚本，或手动）："
-  echo "   # 手动方式（粘贴公钥到服务器）："
-  echo "   ssh -p $port $user@<VPS_IP> 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'"
+  echo "3) 把公钥写入 VPS（手动粘贴方式）："
+  echo "   ssh -p ${port} ${user}@<VPS_IP> 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'"
+  echo "   # 然后粘贴公钥那一整行，回车，再 Ctrl+D 结束输入"
   echo
   echo "4) 测试登录："
-  echo "   ssh -p $port $user@<VPS_IP>"
+  echo "   ssh -p ${port} ${user}@<VPS_IP>"
   echo
   echo "重要提醒："
-  echo " - 如果你更改了 SSH 端口，务必在云厂商安全组/防火墙放行 ${port}/tcp"
+  echo " - 如果你改了 SSH 端口，务必在云厂商安全组/防火墙放行 ${port}/tcp"
   echo " - 建议确认新用户+公钥能登录后，再做“禁 root/禁密码”的加固"
   echo "=========================================================="
   echo
@@ -201,8 +197,8 @@ main() {
   prepare_user_and_ssh "$user"
   maybe_add_sudo "$user"
   new_port="$(maybe_change_port "$cfg" "$sshd_bin" "$old_port")"
-
   print_next_steps "$user" "$new_port"
+
   ok "Step1 完成 ✅"
 }
 
