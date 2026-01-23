@@ -1056,9 +1056,14 @@ main_menu() {
           die "未加载 swap 插件：plugins/14_swap.sh（请确认文件存在且 load_plugins 已执行）"
         fi
         ;;
-       15)
-        if declare -F nezha_agent_menu >/dev/null 2>&1; then
+
+      15)
+        if declare -F nezha_menu >/dev/null 2>&1; then
+          nezha_menu
+        elif declare -F nezha_agent_menu >/dev/null 2>&1; then
           nezha_agent_menu
+        elif declare -F nezha_agent_manage_menu >/dev/null 2>&1; then
+          nezha_agent_manage_menu
         else
           die "未加载 nezha 插件：plugins/15_nezha_agent.sh（请确认文件存在且 load_plugins 已执行）"
         fi
