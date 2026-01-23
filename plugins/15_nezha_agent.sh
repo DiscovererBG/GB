@@ -1,206 +1,272 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NEZHA_SERVICE="nezha-agent"
-NEZHA_BACKUP_DIR="/root/nezha-backups"
+type die  >/dev/null 2>&1 || die(){  echo "❌ $*" >&2; exit 1; }
+type ok   >/dev/null 2>&1 || ok(){   echo "✅ $*" >&2; }
+type warn >/dev/null 2>&1 || warn(){ echo "⚠️  $*" >&2; }
+type info >/dev/null 2>&1 || info(){ echo "ℹ️  $*" >&2; }
+type hr   >/dev/null 2>&1 || hr(){ printf "%s\n" "------------------------------------------------------------"; }
 
-nezha_detect_unit() {
-  if systemctl list-unit-files 2>/dev/null | grep -qE '^nezha-agent\.service'; then
-    NEZHA_SERVICE="nezha-agent"
-  elif systemctl list-unit-files 2>/dev/null | grep -qE '^nezha\.service'; then
-    NEZHA_SERVICE="nezha"
-  else
-    NEZHA_SERVICE="nezha-agent"
+need_root(){ [[ ${EUID:-0} -eq 0 ]] || die "请用 root 运行"; }
+
+nezha_service_name() {
+  if command -v systemctl >/dev/null 2>&1; then
+    for n in nezha-agent nezha nezha_agent; do
+      systemctl list-unit-files 2>/dev/null | grep -qE "^${n}\.service" && { echo "$n"; return 0; }
+    done
   fi
+  echo "nezha-agent"
+}
+
+nezha_install_dir() {
+  [[ -d /opt/nezha-agent ]] && { echo /opt/nezha-agent; return 0; }
+  [[ -d /opt/nezha ]] && { echo /opt/nezha; return 0; }
+  echo /opt/nezha-agent
+}
+
+nezha_bin_path() {
+  local d; d="$(nezha_install_dir)"
+  [[ -x "${d}/nezha-agent" ]] && { echo "${d}/nezha-agent"; return 0; }
+  command -v nezha-agent >/dev/null 2>&1 && { command -v nezha-agent; return 0; }
+  echo ""
 }
 
 nezha_status() {
-  hr
-  echo "${CBOLD}${CCYA}哪吒 Agent 状态${C0}"
-  hr
-
-  nezha_detect_unit
+  need_root
+  local svc; svc="$(nezha_service_name)"
+  hr; echo "哪吒 Agent 状态"; hr
 
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl status "${NEZHA_SERVICE}.service" --no-pager 2>/dev/null || true
-    echo
-    echo "---- 最近日志（50行） ----"
-    journalctl -u "${NEZHA_SERVICE}.service" -n 50 --no-pager 2>/dev/null || true
+    systemctl status "${svc}.service" --no-pager 2>/dev/null || true
   else
-    ps -ef | grep -E 'nezha-agent' | grep -v grep || true
+    pgrep -af "nezha-agent" || echo "未发现 nezha-agent 进程"
   fi
+
+  echo
+  echo "二进制：$(nezha_bin_path || true)"
+  echo "目录：$(nezha_install_dir)"
 }
 
 nezha_logs() {
-  hr
-  echo "${CBOLD}${CCYA}哪吒 Agent 日志（最近 200 行）${C0}"
-  hr
-
-  nezha_detect_unit
-  if command -v journalctl >/dev/null 2>&1; then
-    journalctl -u "${NEZHA_SERVICE}.service" -n 200 --no-pager 2>/dev/null || warn "journalctl 读取失败"
+  need_root
+  local svc; svc="$(nezha_service_name)"
+  hr; echo "哪吒 Agent 日志（最近 200 行）"; hr
+  if command -v journalctl >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+    journalctl -u "${svc}.service" -n 200 --no-pager 2>/dev/null || \
+    journalctl -n 200 --no-pager 2>/dev/null | grep -Ei "nezha|agent" || true
   else
-    warn "系统无 journalctl（非 systemd），请用 ps 查看或检查 /var/log"
+    # 非 systemd：尽力从 syslog/messages 里捞
+    (tail -n 500 /var/log/syslog 2>/dev/null || true; tail -n 500 /var/log/messages 2>/dev/null || true) | \
+      grep -Ei "nezha|agent" | tail -n 200 || true
   fi
 }
 
-nezha_start() {
-  nezha_detect_unit
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl start "${NEZHA_SERVICE}.service" || true
-    systemctl enable "${NEZHA_SERVICE}.service" >/dev/null 2>&1 || true
-    ok "已启动并设置开机自启：${NEZHA_SERVICE}.service"
-  else
-    warn "非 systemd 系统，无法 systemctl start；请用你的启动方式运行 agent"
+need_cmd() { command -v "$1" >/dev/null 2>&1 || return 1; }
+
+install_deps() {
+  if need_cmd unzip && (need_cmd curl || need_cmd wget); then return 0; fi
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y unzip curl ca-certificates || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y unzip curl ca-certificates || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y unzip curl ca-certificates || true
   fi
+  need_cmd unzip || die "缺少 unzip，且自动安装失败"
+  (need_cmd curl || need_cmd wget) || die "缺少 curl/wget，且自动安装失败"
 }
 
-nezha_stop() {
-  nezha_detect_unit
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop "${NEZHA_SERVICE}.service" || true
-    systemctl disable "${NEZHA_SERVICE}.service" >/dev/null 2>&1 || true
-    ok "已停止并取消自启：${NEZHA_SERVICE}.service"
-  else
-    warn "非 systemd 系统，无法 systemctl stop"
-  fi
+arch_asset() {
+  local m; m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) echo "linux_amd64" ;;
+    aarch64|arm64) echo "linux_arm64" ;;
+    armv7l|armv7) echo "linux_arm" ;;
+    i386|i686) echo "linux_386" ;;
+    *) die "不支持的架构：$m" ;;
+  esac
 }
 
-nezha_restart() {
-  nezha_detect_unit
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart "${NEZHA_SERVICE}.service" || true
-    ok "已重启：${NEZHA_SERVICE}.service"
+download_file() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$out"
   else
-    warn "非 systemd 系统，无法 systemctl restart"
+    wget -qO "$out" "$url"
   fi
 }
 
 nezha_install_or_update() {
+  need_root
+  install_deps
+
+  local d; d="$(nezha_install_dir)"
+  mkdir -p "$d"
+
   hr
-  echo "${CBOLD}${CCYA}安装/更新 哪吒 Agent（推荐：粘贴面板 Install Command）${C0}"
+  echo "安装/更新 哪吒 Agent"
   hr
-  echo "请去 Dashboard：Servers 页面 -> Install Command 复制整条命令"
-  echo "把整条命令粘贴到下面这一行（只一行），回车执行。"
-  echo "（你不需要手动填 server/client_secret/uuid）"
-  hr
-  read -r -p "粘贴 Install Command： " cmd
-  cmd="$(echo "$cmd" | sed -e 's/^[[:space:]]\+//; s/[[:space:]]\+$//')"
-  [[ -n "$cmd" ]] || die "命令不能为空"
+  echo "你需要准备 3 个东西："
+  echo "1) server：面板里“Agent 对接地址(域名/IP:端口)” 例如 data.example.com:8008"
+  echo "2) client_secret：Dashboard 配置里的 agentsecretkey（或面板生成的安装信息里给的）"
+  echo "3) uuid：唯一标识（留空自动生成）"
+  echo
 
-  warn "即将执行你粘贴的命令（来源：你的 Nezha Dashboard）"
-  read -r -p "输入 YES 才执行: " yn
-  [[ "$yn" == "YES" ]] || { warn "已取消"; return 0; }
+  read -r -p "server (例如 data.example.com:8008): " server
+  [[ -n "${server:-}" ]] || die "server 不能为空"
 
-  bash -c "$cmd"
-  ok "安装/更新命令已执行完成（请回到 Dashboard 查看是否上线）"
-}
+  read -r -p "client_secret: " secret
+  [[ -n "${secret:-}" ]] || die "client_secret 不能为空"
 
-nezha_guess_paths() {
-  cat <<EOF2
-/etc/systemd/system/nezha-agent.service
-/etc/systemd/system/nezha.service
-/opt/nezha
-/opt/nezha/agent
-/usr/local/bin/nezha-agent
-/usr/bin/nezha-agent
-EOF2
-}
+  read -r -p "tls 是否启用？(yes/no) [默认 no]: " tls
+  tls="${tls:-no}"
+  [[ "$tls" == "yes" || "$tls" == "no" ]] || die "tls 只能 yes/no"
 
-nezha_backup() {
-  hr
-  echo "${CBOLD}${CCYA}备份 哪吒 Agent${C0}"
-  hr
+  local uuid=""
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuid="$(uuidgen)"
+  else
+    uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  fi
+  read -r -p "uuid [默认自动生成 ${uuid}]: " u2
+  uuid="${u2:-$uuid}"
 
-  mkdir -p "$NEZHA_BACKUP_DIR"
+  local asset; asset="$(arch_asset)"
+  local zip="/tmp/nezha-agent_${asset}.zip"
+  local url="https://github.com/nezhahq/agent/releases/latest/download/nezha-agent_${asset}.zip"
 
-  local ts out tmp
-  ts="$(date +%F_%H%M%S)"
-  out="${NEZHA_BACKUP_DIR}/nezha-agent_${ts}.tar.gz"
-  tmp="/tmp/nezha-agent-backup-${ts}"
-  rm -rf "$tmp"
-  mkdir -p "$tmp"
+  info "下载：$url"
+  download_file "$url" "$zip"
 
-  while IFS= read -r p; do
-    [[ -e "$p" ]] || continue
-    mkdir -p "${tmp}$(dirname "$p")"
-    cp -a "$p" "${tmp}${p}"
-  done < <(nezha_guess_paths)
+  info "解压到：$d"
+  rm -f "${d}/nezha-agent" 2>/dev/null || true
+  unzip -o "$zip" -d "$d" >/dev/null
+  chmod +x "${d}/nezha-agent"
+
+  info "写入配置：${d}/config.yml"
+  cat > "${d}/config.yml" <<YAML
+client_secret: ${secret}
+server: ${server}
+uuid: ${uuid}
+tls: ${tls}
+debug: false
+disable_auto_update: false
+YAML
 
   if command -v systemctl >/dev/null 2>&1; then
-    nezha_detect_unit
-    systemctl cat "${NEZHA_SERVICE}.service" > "${tmp}/SYSTEMD_UNIT_${NEZHA_SERVICE}.txt" 2>/dev/null || true
-  fi
+    info "写入 systemd 服务：/etc/systemd/system/nezha-agent.service"
+    cat > /etc/systemd/system/nezha-agent.service <<UNIT
+[Unit]
+Description=Nezha Agent
+After=network.target
 
-  tar -czf "$out" -C "$tmp" .
-  rm -rf "$tmp"
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${d}/nezha-agent -c ${d}/config.yml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable nezha-agent >/dev/null 2>&1 || true
+    systemctl restart nezha-agent >/dev/null 2>&1 || systemctl start nezha-agent >/dev/null 2>&1 || true
+    ok "安装/更新完成，已启动 nezha-agent"
+  else
+    warn "系统无 systemd：已安装二进制与 config.yml。你需要手动后台运行："
+    echo "${d}/nezha-agent -c ${d}/config.yml &"
+  fi
+}
+
+nezha_start(){ need_root; local svc; svc="$(nezha_service_name)"; systemctl start "${svc}.service" 2>/dev/null || true; ok "已尝试启动 ${svc}"; }
+nezha_stop(){ need_root; local svc; svc="$(nezha_service_name)"; systemctl stop "${svc}.service" 2>/dev/null || true; ok "已尝试停止 ${svc}"; }
+nezha_restart(){ need_root; local svc; svc="$(nezha_service_name)"; systemctl restart "${svc}.service" 2>/dev/null || true; ok "已尝试重启 ${svc}"; }
+
+backup_dir(){ echo "/root/nezha-agent-backups"; }
+
+nezha_backup() {
+  need_root
+  local d; d="$(nezha_install_dir)"
+  local svc="/etc/systemd/system/nezha-agent.service"
+  local outd; outd="$(backup_dir)"
+  mkdir -p "$outd"
+  local ts; ts="$(date +%F_%H%M%S)"
+  local out="${outd}/nezha-agent_backup_${ts}.tar.gz"
+
+  hr; echo "备份 哪吒 Agent"; hr
+  tar -czf "$out" \
+    "$d" \
+    $( [[ -f "$svc" ]] && echo "$svc" ) \
+    2>/dev/null || die "打包失败"
 
   ok "备份完成：$out"
-  echo "提示：恢复时需要这个 tar.gz 文件路径"
 }
 
 nezha_restore() {
-  hr
-  echo "${CBOLD}${CCYA}恢复 哪吒 Agent${C0}"
-  hr
-  echo "把你之前备份的文件路径粘贴进来，例如："
-  echo "  ${NEZHA_BACKUP_DIR}/nezha-agent_2026-01-23_120000.tar.gz"
-  read -r -p "备份文件路径： " f
-  [[ -f "$f" ]] || die "找不到备份文件：$f"
+  need_root
+  local outd; outd="$(backup_dir)"
+  hr; echo "恢复 哪吒 Agent"; hr
+  ls -1t "${outd}"/nezha-agent_backup_*.tar.gz 2>/dev/null | head -n 10 || { die "没找到备份：${outd}/nezha-agent_backup_*.tar.gz"; }
+  echo
+  read -r -p "把要恢复的备份文件完整路径粘贴出来: " f
+  [[ -f "$f" ]] || die "文件不存在：$f"
 
-  warn "将覆盖恢复到系统路径（/etc/systemd/system、/opt/nezha 等），请确认。"
-  read -r -p "输入 YES 才继续恢复: " yn
-  [[ "$yn" == "YES" ]] || { warn "已取消"; return 0; }
-
-  tar -xzf "$f" -C /
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
+    systemctl stop nezha-agent 2>/dev/null || true
   fi
 
-  ok "恢复完成。你可以在菜单里执行：启动/重启，然后看日志/状态。"
+  tar -xzf "$f" -C / 2>/dev/null || die "解压失败"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable nezha-agent >/dev/null 2>&1 || true
+    systemctl restart nezha-agent >/dev/null 2>&1 || true
+  fi
+  ok "恢复完成"
 }
 
 nezha_uninstall() {
-  hr
-  echo "${CBOLD}${CCYA}卸载 哪吒 Agent（谨慎）${C0}"
-  hr
-  warn "这会停止服务，并尝试移除常见安装路径。"
+  need_root
+  hr; echo "卸载 哪吒 Agent"; hr
   read -r -p "输入 YES 才卸载: " yn
   [[ "$yn" == "YES" ]] || { warn "已取消"; return 0; }
 
-  nezha_stop || true
-
-  rm -f /etc/systemd/system/nezha-agent.service /etc/systemd/system/nezha.service 2>/dev/null || true
-  rm -rf /opt/nezha/agent /opt/nezha 2>/dev/null || true
-  rm -f /usr/local/bin/nezha-agent /usr/bin/nezha-agent 2>/dev/null || true
-
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
+    systemctl stop nezha-agent 2>/dev/null || true
+    systemctl disable nezha-agent 2>/dev/null || true
   fi
+  rm -f /etc/systemd/system/nezha-agent.service 2>/dev/null || true
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
 
-  ok "卸载动作已执行（如你是自定义路径安装，可能还需手动清理）"
+  local d; d="$(nezha_install_dir)"
+  rm -rf "$d" 2>/dev/null || true
+
+  ok "已卸载（配置与二进制已删除；备份保留在 /root/nezha-agent-backups）"
 }
 
-nezha_agent_menu() {
+nezha_menu() {
   while true; do
     echo
     hr
-    echo "${CBOLD}${CCYA}哪吒 Agent 管理${C0}"
-    echo "${CBOLD}${CCYA}============================================================${C0}"
+    echo "哪吒 Agent 管理"
+    echo "============================================================"
     echo "  1) 状态"
-    echo "  2) 安装/更新（粘贴 Dashboard Install Command）"
+    echo "  2) 安装/更新（下载最新 Agent + 写 config.yml + 建服务）"
     echo "  3) 启动"
     echo "  4) 停止"
     echo "  5) 重启"
     echo "  6) 查看日志"
-    echo "  7) 备份（打包常见路径）"
-    echo "  8) 恢复（从备份 tar.gz 恢复）"
+    echo "  7) 备份"
+    echo "  8) 恢复"
     echo "  9) 卸载"
     echo
     echo "  0) 返回上级菜单"
-    echo "${CBOLD}${CCYA}============================================================${C0}"
+    echo "============================================================"
     read -r -p "请选择 (0-9): " c
-
     case "$c" in
       1) nezha_status; read -r -p "回车继续..." _ ;;
       2) nezha_install_or_update; read -r -p "回车继续..." _ ;;
