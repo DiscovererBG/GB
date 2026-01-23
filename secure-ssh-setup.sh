@@ -46,28 +46,44 @@ load_plugins() {
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || true)"
   local plugin_dir="${script_dir}/plugins"
 
-  # 2) 如果是 curl 方式运行，BASH_SOURCE[0] 往往是 /dev/fd/xx，plugins 不存在
-  #    fallback：把插件下载到 /tmp 再加载
+  # 2) curl 方式运行时：BASH_SOURCE[0] 往往是 /dev/fd/xx，本地 plugins 不存在
+  #    fallback：读取 plugins/plugins.list，然后下载到 /tmp 再加载
   if [[ ! -d "$plugin_dir" ]]; then
     plugin_dir="/tmp/secure-ssh-setup-plugins"
     mkdir -p "$plugin_dir"
 
-    local base="https://raw.githubusercontent.com/DiscovererBG/GB/main/plugins"
-    local files=("14_swap.sh")   # 以后新增插件就往这里加文件名
+    local base_raw="https://raw.githubusercontent.com/DiscovererBG/GB/main"
+    local list_url="${base_raw}/plugins/plugins.list"
+    local list_file="${plugin_dir}/plugins.list"
 
+    # 下载 plugins.list
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$list_url" -o "$list_file" || die "无法下载插件列表：$list_url"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$list_file" "$list_url" || die "无法下载插件列表：$list_url"
+    else
+      die "缺少 curl/wget，无法自动下载插件列表"
+    fi
+
+    # 逐行读取插件文件名（忽略空行/注释行）
     local f
-    for f in "${files[@]}"; do
+    while IFS= read -r f; do
+      f="${f%%#*}"                         # 去掉行内注释
+      f="$(echo "$f" | xargs 2>/dev/null)" # trim
+      [[ -n "$f" ]] || continue
+
+      # 只允许 .sh 文件名，避免意外下载
+      [[ "$f" == *.sh ]] || continue
+
       if [[ ! -s "${plugin_dir}/${f}" ]]; then
         if command -v curl >/dev/null 2>&1; then
-          curl -fsSL "${base}/${f}" -o "${plugin_dir}/${f}"
-        elif command -v wget >/dev/null 2>&1; then
-          wget -qO "${plugin_dir}/${f}" "${base}/${f}"
+          curl -fsSL "${base_raw}/plugins/${f}" -o "${plugin_dir}/${f}" || die "下载插件失败：${f}"
         else
-          die "缺少 curl/wget，无法自动下载插件：${f}"
+          wget -qO "${plugin_dir}/${f}" "${base_raw}/plugins/${f}" || die "下载插件失败：${f}"
         fi
         chmod +x "${plugin_dir}/${f}" 2>/dev/null || true
       fi
-    done
+    done < "$list_file"
   fi
 
   # 3) 加载 plugins 下的所有 .sh
