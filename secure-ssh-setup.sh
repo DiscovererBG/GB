@@ -70,7 +70,7 @@ load_plugins() {
 
     # 逐个下载插件（忽略空行和 # 注释；同时去掉 CRLF 的 \\r）
     while IFS= read -r line; do
-      line="${line//$r/}"
+      line="${line//$'\r'/}"
       [[ -n "$line" ]] || continue
       [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
@@ -92,7 +92,7 @@ load_plugins() {
   local list="${plugin_dir}/plugins.list"
   if [[ -f "$list" ]]; then
     while IFS= read -r f; do
-      f="${f//$r/}"
+      f="${f//$'\r'/}"
       [[ -n "$f" ]] || continue
       [[ "$f" =~ ^[[:space:]]*# ]] && continue
       [[ -f "${plugin_dir}/${f}" ]] || continue
