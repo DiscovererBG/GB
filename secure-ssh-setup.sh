@@ -36,11 +36,22 @@ ok(){  echo "${CGRN}✅ $*${C0}" >&2; }
 warn(){ echo "${CYEL}⚠️  $*${C0}" >&2; }
 info(){ echo "${CCYA}ℹ️  $*${C0}" >&2; }
 
+# ---------- plugins ----------
+BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="${BASE_DIR}/plugins"
+
+load_plugins() {
+  [[ -d "$PLUGIN_DIR" ]] || return 0
+  for f in "$PLUGIN_DIR"/*.sh; do
+    [[ -e "$f" ]] || continue
+    # shellcheck source=/dev/null
+    source "$f"
+  done
+}
 hr(){ printf "%s\n" "------------------------------------------------------------"; }
 
 # ---------- root check ----------
 [[ ${EUID:-0} -eq 0 ]] || die "请用 root 运行（sudo -i / su - / 直接 root 登录）"
-
 CFG="/etc/ssh/sshd_config"
 SSHD_BIN=""
 SERVICE_NAME="ssh"
@@ -813,6 +824,7 @@ menu_header() {
 }
 
 main_menu() {
+  load_plugins
   detect_sshd
   detect_service
   warn_hosts_if_needed
@@ -841,10 +853,10 @@ main_menu() {
     echo " 11) 更新当前系统（apt/yum/dnf 自动识别）"
     echo " 12) 查看日志（SSH/登录认证/失败登录/实时跟踪）"
     echo " 13) 拓展口（生成未来新增工具/脚本的模板文本）"
-    echo
+    echo " 14) SWAP/虚拟内存 管理（创建/删除/调优）"
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
-    read -r -p "请选择 (0-13): " c
+    read -r -p "请选择 (0-14): " c
 
     case "$c" in
       1)
@@ -978,6 +990,13 @@ main_menu() {
         ;;
       13)
         expansion_slot_generate_template
+        ;;
+      14)
+        if declare -F swap_menu >/dev/null 2>&1; then
+          swap_menu
+        else
+          die "未加载 swap 插件：plugins/14_swap.sh（请确认文件存在且 load_plugins 已执行）"
+        fi
         ;;
       0)
         exit 0
