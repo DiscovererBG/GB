@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -902,9 +903,10 @@ main_menu() {
     echo " 12) 查看日志（SSH/登录认证/失败登录/实时跟踪）"
     echo " 13) 拓展口（生成未来新增工具/脚本的模板文本）"
     echo " 14) SWAP/虚拟内存 管理（创建/删除/调优）"
+    echo " 15) 哪吒 Agent 管理（安装/启动/日志/备份恢复）"
     echo "  0) 退出"
     echo "${CBOLD}${CCYA}==============================================================${C0}"
-    read -r -p "请选择 (0-14): " c
+    read -r -p "请选择 (0-15): " c
 
     case "$c" in
       1)
@@ -1044,6 +1046,13 @@ main_menu() {
           swap_menu
         else
           die "未加载 swap 插件：plugins/14_swap.sh（请确认文件存在且 load_plugins 已执行）"
+        fi
+        ;;
+       15)
+        if declare -F nezha_agent_menu >/dev/null 2>&1; then
+          nezha_agent_menu
+        else
+          die "未加载 nezha 插件：plugins/15_nezha_agent.sh（请确认文件存在且 load_plugins 已执行）"
         fi
         ;;
       0)
