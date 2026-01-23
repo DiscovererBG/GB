@@ -1,1 +1,6 @@
 secure-ssh-setup.sh.bak2
+
+# local backups
+*.bak
+*.bak.*
+.backup_wizard/
