@@ -42,70 +42,66 @@ BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="${BASE_DIR}/plugins"
 
 load_plugins() {
-  # 适配两种运行方式：
-  # - git clone 运行：脚本目录存在 ./plugins
-  # - curl 运行：脚本来自 /dev/fd/*，则把插件下载到 /tmp 再 source
-
-  local script_dir plugin_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || true)"
+  local script_dir plugin_dir base_root list_url list_file
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
   plugin_dir="${script_dir}/plugins"
 
-  # curl 模式：脚本目录通常是 /dev/fd/*，不存在 plugins
-  if [[ ! -d "$plugin_dir" ]]; then
+  base_root="https://raw.githubusercontent.com/DiscovererBG/GB/main"
+
+  if [[ "${script_dir}" == /dev/fd/* || ! -d "${plugin_dir}" ]]; then
     plugin_dir="/tmp/secure-ssh-setup-plugins"
-    mkdir -p "$plugin_dir"
+    mkdir -p "${plugin_dir}"
 
-    local base="https://raw.githubusercontent.com/DiscovererBG/GB/main"
-    local list_url="${base}/plugins/plugins.list"
-    local list_file="${plugin_dir}/plugins.list"
+    list_url="${base_root}/plugins/plugins.list"
+    list_file="${plugin_dir}/plugins.list"
 
-    # 拉取 plugins.list（带容错：curl/wget 二选一）
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$list_url" -o "$list_file" || die "无法下载插件列表：$list_url"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -qO "$list_file" "$list_url" || die "无法下载插件列表：$list_url"
-    else
-      die "缺少 curl/wget，无法自动下载插件列表"
+    if [[ ! -s "${list_file}" ]]; then
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${list_url}" -o "${list_file}" || true
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "${list_file}" "${list_url}" || true
+      fi
     fi
 
-    # 逐个下载插件（忽略空行和 # 注释；同时去掉 CRLF 的 \\r）
-    while IFS= read -r line; do
-      line="${line//$'\r'/}"
-      [[ -n "$line" ]] || continue
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ -s "${list_file}" ]]; then
+      while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ -z "${line}" ]] && continue
+        [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+        local f="${line}"
+        [[ -s "${plugin_dir}/${f}" ]] && continue
 
-      local url="${base}/plugins/${line}"
-      local dst="${plugin_dir}/${line}"
-
-      if [[ ! -s "$dst" ]]; then
         if command -v curl >/dev/null 2>&1; then
-          curl -fsSL "$url" -o "$dst" || die "无法下载插件：$url"
+          curl -fsSL "${base_root}/plugins/${f}" -o "${plugin_dir}/${f}" || true
+        elif command -v wget >/dev/null 2>&1; then
+          wget -qO "${plugin_dir}/${f}" "${base_root}/plugins/${f}" || true
         else
-          wget -qO "$dst" "$url" || die "无法下载插件：$url"
+          die "缺少 curl/wget，无法下载插件：${f}"
         fi
-        chmod +x "$dst" 2>/dev/null || true
-      fi
-    done < "$list_file"
+
+        chmod +x "${plugin_dir}/${f}" 2>/dev/null || true
+      done < "${list_file}"
+    fi
   fi
 
-  # source 插件：优先按 plugins.list；没有 list 就 source 全部 *.sh
-  local list="${plugin_dir}/plugins.list"
-  if [[ -f "$list" ]]; then
-    while IFS= read -r f; do
-      f="${f//$'\r'/}"
-      [[ -n "$f" ]] || continue
-      [[ "$f" =~ ^[[:space:]]*# ]] && continue
-      [[ -f "${plugin_dir}/${f}" ]] || continue
-      # shellcheck disable=SC1090
-      source "${plugin_dir}/${f}"
-    done < "$list"
-  else
-    local pf
-    for pf in "$plugin_dir"/*.sh; do
-      [[ -f "$pf" ]] || continue
-      # shellcheck disable=SC1090
-      source "$pf"
-    done
+  if [[ -d "${plugin_dir}" ]]; then
+    local list="${plugin_dir}/plugins.list"
+    if [[ -s "${list}" ]]; then
+      while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ -z "${line}" ]] && continue
+        [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+        local pf="${plugin_dir}/${line}"
+        [[ -f "${pf}" ]] || continue
+        source "${pf}"
+      done < "${list}"
+    else
+      local pf
+      for pf in "${plugin_dir}"/*.sh; do
+        [[ -f "${pf}" ]] || continue
+        source "${pf}"
+      done
+    fi
   fi
 }
 
