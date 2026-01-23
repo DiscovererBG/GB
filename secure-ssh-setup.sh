@@ -41,12 +41,44 @@ BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="${BASE_DIR}/plugins"
 
 load_plugins() {
-  [[ -d "$PLUGIN_DIR" ]] || return 0
-  for f in "$PLUGIN_DIR"/*.sh; do
-    [[ -e "$f" ]] || continue
-    # shellcheck source=/dev/null
-    source "$f"
-  done
+  # 1) 优先从“脚本所在目录”的 plugins 加载（适配 git clone 运行）
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || true)"
+  local plugin_dir="${script_dir}/plugins"
+
+  # 2) 如果是 curl 方式运行，BASH_SOURCE[0] 往往是 /dev/fd/xx，plugins 不存在
+  #    fallback：把插件下载到 /tmp 再加载
+  if [[ ! -d "$plugin_dir" ]]; then
+    plugin_dir="/tmp/secure-ssh-setup-plugins"
+    mkdir -p "$plugin_dir"
+
+    local base="https://raw.githubusercontent.com/DiscovererBG/GB/main/plugins"
+    local files=("14_swap.sh")   # 以后新增插件就往这里加文件名
+
+    local f
+    for f in "${files[@]}"; do
+      if [[ ! -s "${plugin_dir}/${f}" ]]; then
+        if command -v curl >/dev/null 2>&1; then
+          curl -fsSL "${base}/${f}" -o "${plugin_dir}/${f}"
+        elif command -v wget >/dev/null 2>&1; then
+          wget -qO "${plugin_dir}/${f}" "${base}/${f}"
+        else
+          die "缺少 curl/wget，无法自动下载插件：${f}"
+        fi
+        chmod +x "${plugin_dir}/${f}" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # 3) 加载 plugins 下的所有 .sh
+  if [[ -d "$plugin_dir" ]]; then
+    local pf
+    for pf in "$plugin_dir"/*.sh; do
+      [[ -f "$pf" ]] || continue
+      # shellcheck disable=SC1090
+      source "$pf"
+    done
+  fi
 }
 hr(){ printf "%s\n" "------------------------------------------------------------"; }
 
