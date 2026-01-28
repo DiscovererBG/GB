@@ -13,9 +13,13 @@
 #   - 备份：/root/fzb_backups/...
 #
 # 不会做的事：
-#   - 不改 sshd_config（你改 SSH 端口后需要在这里“写入/更新配置”同步到 fail2ban）
+#   - 不改 sshd_config
 #   - 不改 UFW/Firewalld 的配置文件
-#   - fail2ban 封禁会动态写内核防火墙规则（这是 fail2ban 正常工作方式）
+#   - fail2ban 封禁会动态写内核防火墙规则（这是正常工作方式）
+#
+# ✅ 本版本修复：
+#   - 顶部“规则组”显示 ? 的问题：兼容 “Number of jail:      1”（冒号后多空格）
+#   - 所有 “Jail” 文案统一中文 “规则组”
 # =========================================================
 
 set -euo pipefail
@@ -80,7 +84,6 @@ timestamp(){ date +%Y%m%d%H%M%S; }
 JAIL_LOCAL="/etc/fail2ban/jail.local"
 F2B_DIR="/etc/fail2ban"
 BACKUP_DIR="/root/fzb_backups"
-
 ensure_dirs(){ mkdir -p "$BACKUP_DIR"; }
 
 # -------------------- 系统/服务辅助 --------------------
@@ -94,7 +97,6 @@ detect_pkg_mgr(){
 }
 
 svc(){
-  # 用法：svc start|stop|restart|status|enable|disable
   local action="$1"
   if has_cmd systemctl; then
     case "$action" in
@@ -119,7 +121,6 @@ svc(){
 f2b_installed(){ has_cmd fail2ban-client; }
 
 detect_ssh_port(){
-  # 优先从监听端口推断，其次读取 sshd_config；最后默认 22
   local port=""
   if has_cmd ss; then
     port="$(ss -ltnp 2>/dev/null | awk "/sshd/ {print \$4}" | sed -n "s/.*:\([0-9][0-9]*\)$/\1/p" | head -n1 || true)"
@@ -140,18 +141,22 @@ f2b_version(){
   echo "${v:-?}"
 }
 
-# ✅ 修复点：顶部摘要不再“误显示 0”
-#   - 取不到就重试一次
-#   - 仍取不到就显示 ?（避免误导）
+# ✅ 彻底修复：兼容冒号后多个空格，避免顶部“规则组: ?”
 jail_count(){
   if ! f2b_installed; then echo "-"; return; fi
 
   local n=""
-  n="$(fail2ban-client status 2>/dev/null | awk -F': ' '/Number of jail/ {print $2}' | head -n1 || true)"
+  n="$(fail2ban-client status 2>/dev/null \
+      | sed -n 's/.*Number of jail:[[:space:]]*//p' \
+      | head -n1 \
+      | tr -d '[:space:]' || true)"
 
   if [ -z "${n:-}" ]; then
     sleep 0.2
-    n="$(fail2ban-client status 2>/dev/null | awk -F': ' '/Number of jail/ {print $2}' | head -n1 || true)"
+    n="$(fail2ban-client status 2>/dev/null \
+        | sed -n 's/.*Number of jail:[[:space:]]*//p' \
+        | head -n1 \
+        | tr -d '[:space:]' || true)"
   fi
 
   if [ -z "${n:-}" ]; then
@@ -165,7 +170,7 @@ sshd_banned_now(){
   if ! f2b_installed; then echo "-"; return; fi
   if fail2ban-client status sshd >/dev/null 2>&1; then
     local n=""
-    n="$(fail2ban-client status sshd 2>/dev/null | awk -F': ' '/Currently banned/ {print $2}' | head -n1 || true)"
+    n="$(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p' | head -n1 | tr -d '[:space:]' || true)"
     echo "${n:-0}"
   else
     echo "-"
@@ -173,7 +178,6 @@ sshd_banned_now(){
 }
 
 sshd_banned_24h(){
-  # 统计最近 24 小时 fail2ban.log 中与 sshd 封禁有关的次数（尽力统计）
   local log="/var/log/fail2ban.log"
   [ -f "$log" ] || { echo "-"; return; }
 
@@ -265,7 +269,7 @@ install_fail2ban(){
   ok "fail2ban 安装完成。"
 }
 
-# -------------------- 写入/更新 jail.local（启用 sshd 防爆破） --------------------
+# -------------------- 写入/更新 jail.local（启用 SSH 防爆破） --------------------
 write_jail_local(){
   local ssh_port; ssh_port="$(detect_ssh_port)"
   echo
@@ -288,7 +292,6 @@ write_jail_local(){
   backup_f2b
   mkdir -p "$F2B_DIR"
 
-  # 说明：这里会覆盖写入 jail.local（更直观、最不易出错）
   cat > "$JAIL_LOCAL" <<EOF
 [DEFAULT]
 # 封禁时长：例如 30m / 1h / 24h
@@ -604,7 +607,7 @@ menu_loop(){
 
 # -------------------- 入口 --------------------
 case "${1:-}" in
-  install) self_install "$0" ;;     # 第一次下载后：sudo -i ./fzb.sh install
-  update)  self_update_from_github ;;# 命令行更新：sudo fzb update
-  *)       menu_loop ;;             # 正常运行：sudo fzb
+  install) self_install "$0" ;;
+  update)  self_update_from_github ;;
+  *)       menu_loop ;;
 esac
