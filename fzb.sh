@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # =========================================================
-#  fzb - Fail2ban 菜单式工具箱（单文件版）
+#  fzb - Fail2ban 菜单式工具箱（单文件版 / 彩色美化版）
 # ---------------------------------------------------------
 # 目标：
 #   1) 下载一次 -> 本地 sudo fzb 就能调出菜单
 #   2) 默认不联网；只有“更新脚本”才访问 GitHub
 #   3) 只管理 fail2ban（安装/配置/白名单/封禁/日志/参数）
 #
-# 你会修改到的文件/位置（可控）：
+# 会改动的文件（可控）：
 #   - 安装：/opt/fzb/fzb.sh  +  /usr/local/sbin/fzb(软链接)
 #   - 配置：/etc/fail2ban/jail.local（写入/更新时会覆盖写入）
 #   - 备份：/root/fzb_backups/...
 #
-# 注意：
-#   - 本脚本不会改 sshd_config、不碰 UFW/Firewalld 的“配置文件”
-#   - fail2ban 封禁本质是动态加防火墙规则（这是正常行为）
+# 不会做的事：
+#   - 不改 sshd_config
+#   - 不改 UFW/Firewalld 的“配置文件”
+#   - fail2ban 封禁会动态写内核防火墙规则（这是正常行为）
 # =========================================================
 
 set -euo pipefail
@@ -28,13 +29,41 @@ BIN_PATH="/usr/local/sbin/${APP_NAME}"
 # ✅ 仅“更新脚本”会用到这个地址（已按你提供的填好）
 REPO_RAW_URL="https://raw.githubusercontent.com/DiscovererBG/GB/refs/heads/main/fzb.sh"
 
-# -------------------- 颜色/输出 --------------------
-c_green="\033[1;32m"; c_yellow="\033[1;33m"; c_red="\033[1;31m"; c_blue="\033[1;34m"; c_gray="\033[0;37m"; c_reset="\033[0m"
-ok(){   echo -e "${c_green}✅ ${c_reset}$*"; }
-warn(){ echo -e "${c_yellow}⚠️  ${c_reset}$*"; }
-err(){  echo -e "${c_red}❌ ${c_reset}$*"; }
-info(){ echo -e "${c_blue}ℹ️  ${c_reset}$*"; }
-hr(){   echo -e "${c_gray}---------------------------------------------------------${c_reset}"; }
+# -------------------- 颜色/输出（tput 优先，失败则 ANSI） --------------------
+supports_tput=false
+if command -v tput >/dev/null 2>&1; then
+  if tput colors >/dev/null 2>&1; then supports_tput=true; fi
+fi
+
+if $supports_tput; then
+  C_RESET="$(tput sgr0)"
+  C_BOLD="$(tput bold)"
+  C_DIM="$(tput dim)"
+  C_RED="$(tput setaf 1)"
+  C_GREEN="$(tput setaf 2)"
+  C_YELLOW="$(tput setaf 3)"
+  C_BLUE="$(tput setaf 4)"
+  C_MAGENTA="$(tput setaf 5)"
+  C_CYAN="$(tput setaf 6)"
+  C_GRAY="$(tput setaf 7)"
+else
+  C_RESET="\033[0m"
+  C_BOLD="\033[1m"
+  C_DIM="\033[2m"
+  C_RED="\033[31m"
+  C_GREEN="\033[32m"
+  C_YELLOW="\033[33m"
+  C_BLUE="\033[34m"
+  C_MAGENTA="\033[35m"
+  C_CYAN="\033[36m"
+  C_GRAY="\033[90m"
+fi
+
+ok(){   echo -e "${C_GREEN}${C_BOLD}✅${C_RESET} $*"; }
+warn(){ echo -e "${C_YELLOW}${C_BOLD}⚠️${C_RESET}  $*"; }
+err(){  echo -e "${C_RED}${C_BOLD}❌${C_RESET} $*"; }
+info(){ echo -e "${C_CYAN}${C_BOLD}ℹ️${C_RESET}  $*"; }
+hr(){   echo -e "${C_GRAY}─────────────────────────────────────────────────────────${C_RESET}"; }
 pause(){ read -r -p "回车继续..." _; }
 
 need_root(){
@@ -45,7 +74,6 @@ need_root(){
 }
 
 has_cmd(){ command -v "$1" >/dev/null 2>&1; }
-
 timestamp(){ date +%Y%m%d%H%M%S; }
 
 # -------------------- 路径 --------------------
@@ -102,6 +130,27 @@ detect_ssh_port(){
   echo "${port:-22}"
 }
 
+summary_line(){
+  # 顶部小摘要：端口 / 封禁数 / 白名单是否存在
+  local ssh_port="?"
+  ssh_port="$(detect_ssh_port || echo "?")"
+
+  local banned_now="?"
+  if f2b_installed && fail2ban-client status sshd >/dev/null 2>&1; then
+    banned_now="$(fail2ban-client status sshd 2>/dev/null | awk -F': ' '/Currently banned/ {print $2}' | head -n1 || echo "0")"
+    [ -z "$banned_now" ] && banned_now="0"
+  else
+    banned_now="-"
+  fi
+
+  local has_ignoreip="否"
+  if [ -f "$JAIL_LOCAL" ] && grep -qiE '^\s*ignoreip\s*=' "$JAIL_LOCAL"; then
+    has_ignoreip="是"
+  fi
+
+  echo -e "${C_DIM}SSH端口:${C_RESET} ${C_BOLD}${ssh_port}${C_RESET}   ${C_DIM}当前封禁:${C_RESET} ${C_BOLD}${banned_now}${C_RESET}   ${C_DIM}已设置白名单(ignoreip):${C_RESET} ${C_BOLD}${has_ignoreip}${C_RESET}"
+}
+
 # -------------------- 备份 --------------------
 backup_f2b(){
   ensure_dirs
@@ -116,7 +165,7 @@ backup_f2b(){
   fi
 }
 
-# -------------------- 核心功能：安装 fail2ban --------------------
+# -------------------- 安装 fail2ban --------------------
 install_fail2ban(){
   local pm; pm="$(detect_pkg_mgr)"
   if [ "$pm" = "unknown" ]; then
@@ -142,11 +191,11 @@ install_fail2ban(){
   ok "fail2ban 安装完成。"
 }
 
-# -------------------- 核心功能：写入/更新 jail.local --------------------
+# -------------------- 写入/更新 jail.local --------------------
 write_jail_local(){
   local ssh_port; ssh_port="$(detect_ssh_port)"
   echo
-  info "检测到 SSH 端口：${ssh_port}"
+  info "检测到 SSH 端口：${C_BOLD}${ssh_port}${C_RESET}"
   read -r -p "是否使用这个端口作为防爆破保护端口？[Y/n] " yn || true
   yn="${yn:-Y}"
   if [[ "$yn" =~ ^[Nn]$ ]]; then
@@ -165,7 +214,6 @@ write_jail_local(){
   backup_f2b
   mkdir -p "$F2B_DIR"
 
-  # 说明：这里会覆盖写入 jail.local（更直观、最不出错）
   cat > "$JAIL_LOCAL" <<EOF
 [DEFAULT]
 # 封禁时长：例如 30m / 1h / 24h
@@ -191,7 +239,13 @@ EOF
   ok "fail2ban 已启用并重启。"
 }
 
-# -------------------- 查看状态 --------------------
+# -------------------- 状态/校验 --------------------
+ensure_sshd_jail(){
+  if [ ! -f "$JAIL_LOCAL" ]; then warn "$JAIL_LOCAL 不存在：先执行“写入/更新配置”。"; return 1; fi
+  if ! grep -qi "^\[sshd\]" "$JAIL_LOCAL"; then warn "$JAIL_LOCAL 没有 [sshd]：先写入/更新配置。"; return 1; fi
+  return 0
+}
+
 show_status(){
   if ! f2b_installed; then err "fail2ban 未安装。"; return; fi
   echo
@@ -203,12 +257,6 @@ show_status(){
   echo
   info "sshd jail 状态："
   fail2ban-client status sshd || true
-}
-
-ensure_sshd_jail(){
-  if [ ! -f "$JAIL_LOCAL" ]; then warn "$JAIL_LOCAL 不存在：先执行“写入/更新配置”。"; return 1; fi
-  if ! grep -qi "^\[sshd\]" "$JAIL_LOCAL"; then warn "$JAIL_LOCAL 没有 [sshd]：先写入/更新配置。"; return 1; fi
-  return 0
 }
 
 # -------------------- 封禁/解封/查看封禁 --------------------
@@ -253,20 +301,15 @@ show_whitelist(){
   else
     echo "(jail.local 不存在)"
   fi
-
-  echo
-  info "提示：只加内网段对公网安全影响很小；不加公网 IP 也可以。"
 }
 
 set_whitelist(){
   ensure_sshd_jail || return
 
-  # 先显示现有
   echo
-  info "你现在的 ignoreip（如果没设置会显示为空）："
+  info "当前配置文件里的 ignoreip："
   grep -nEi '^\s*ignoreip\s*=' "$JAIL_LOCAL" 2>/dev/null || echo "(未设置)"
 
-  echo
   hr
   echo "请输入要加入白名单的 IP / 网段（空格分隔），例如："
   echo "  127.0.0.1/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
@@ -276,7 +319,6 @@ set_whitelist(){
 
   backup_f2b
 
-  # 如果已有 ignoreip，就合并去重；否则写入 [DEFAULT] 下方
   local cur=""
   cur="$(awk 'tolower($1)=="ignoreip" && $2=="="{for(i=3;i<=NF;i++) printf $i" "; print ""}' "$JAIL_LOCAL" | tail -n1 | sed 's/[[:space:]]*$//' || true)"
 
@@ -286,7 +328,6 @@ set_whitelist(){
     perl -0777 -i -pe "s/^\s*ignoreip\s*=.*?\$/ignoreip = ${merged}/mi" "$JAIL_LOCAL"
     ok "已合并并更新 ignoreip。"
   else
-    # 插入到 [DEFAULT] 段下
     awk -v ins="ignoreip = ${add}" '
       BEGIN{done=0}
       /^\[DEFAULT\]/{print; if(!done){print ins; done=1; next}}
@@ -398,7 +439,7 @@ self_update_from_github(){
 
   echo
   warn "即将联网从 GitHub 拉取最新脚本："
-  echo "  ${REPO_RAW_URL}"
+  echo -e "  ${C_DIM}${REPO_RAW_URL}${C_RESET}"
   read -r -p "确认更新？输入 YES 继续: " yn
   [ "${yn:-}" = "YES" ] || { warn "取消更新。"; return; }
 
@@ -419,33 +460,48 @@ self_update_from_github(){
 # -------------------- 美化菜单 --------------------
 banner(){
   clear || true
-  echo -e "${c_blue}"
-  echo "███████╗███████╗██████╗ "
-  echo "██╔════╝╚══███╔╝██╔══██╗"
-  echo "█████╗    ███╔╝ ██████╔╝"
-  echo "██╔══╝   ███╔╝  ██╔══██╗"
-  echo "██║     ███████╗██████╔╝"
-  echo "╚═╝     ╚══════╝╚═════╝ "
-  echo -e "${c_reset}"
-  echo -e "${c_gray}Fail2ban 工具箱（默认不联网；只有“更新脚本”才访问 GitHub）${c_reset}"
+  echo -e "${C_MAGENTA}${C_BOLD}"
+  echo "  ███████╗███████╗██████╗ "
+  echo "  ██╔════╝╚══███╔╝██╔══██╗"
+  echo "  █████╗    ███╔╝ ██████╔╝"
+  echo "  ██╔══╝   ███╔╝  ██╔══██╗"
+  echo "  ██║     ███████╗██████╔╝"
+  echo "  ╚═╝     ╚══════╝╚═════╝ "
+  echo -e "${C_RESET}"
+  echo -e "${C_GRAY}Fail2ban 工具箱（默认不联网；只有“更新脚本”才访问 GitHub）${C_RESET}"
+  echo -e "$(summary_line)"
   hr
+}
+
+menu_item(){
+  # menu_item "1" "安装 fail2ban"
+  local key="$1"; shift
+  local text="$*"
+  printf "  %s%s%s) %s\n" "${C_CYAN}${C_BOLD}" "${key}" "${C_RESET}" "${text}"
+}
+
+menu_item2(){
+  # 二级/特殊键
+  local key="$1"; shift
+  local text="$*"
+  printf "  %s%s%s  %s\n" "${C_YELLOW}${C_BOLD}" "${key}" "${C_RESET}" "${text}"
 }
 
 print_menu(){
   banner
-  echo "  1) 安装 fail2ban"
-  echo "  2) 写入/更新 jail.local（启用 sshd 防爆破）"
-  echo "  3) 查看状态（service + jail）"
-  echo "  4) 查看封禁列表（sshd）"
-  echo "  5) 手动封禁 IP（sshd）"
-  echo "  6) 手动解封 IP（sshd）"
-  echo "  7) 查看白名单 ignoreip（sshd）"
-  echo "  8) 设置/追加白名单 ignoreip（sshd）"
-  echo "  9) 一键调参（温和/默认/狠点）"
-  echo " 10) 查看日志（fail2ban / ssh）"
+  menu_item "1"  "安装 fail2ban"
+  menu_item "2"  "写入/更新 jail.local（启用 sshd 防爆破）"
+  menu_item "3"  "查看状态（service + jail）"
+  menu_item "4"  "查看封禁列表（sshd）"
+  menu_item "5"  "手动封禁 IP（sshd）"
+  menu_item "6"  "手动解封 IP（sshd）"
+  menu_item "7"  "查看白名单 ignoreip（sshd）"
+  menu_item "8"  "设置/追加白名单 ignoreip（sshd）"
+  menu_item "9"  "一键调参（温和/默认/狠点）"
+  menu_item "10" "查看日志（fail2ban / ssh）"
   hr
-  echo "  u) 更新脚本（唯一联网项）"
-  echo "  0) 退出"
+  menu_item2 "u" "更新脚本（唯一联网项）"
+  menu_item2 "0" "退出"
   hr
 }
 
@@ -453,7 +509,8 @@ menu_loop(){
   need_root
   while true; do
     print_menu
-    read -r -p "请选择: " choice
+    echo -ne "${C_BOLD}请选择${C_RESET} (${C_CYAN}1-10${C_RESET}/${C_YELLOW}u${C_RESET}/${C_GRAY}0${C_RESET}): "
+    read -r choice
     case "$choice" in
       1) install_fail2ban; pause ;;
       2) install_fail2ban; write_jail_local; pause ;;
@@ -467,14 +524,14 @@ menu_loop(){
       10) view_logs; pause ;;
       u|U) self_update_from_github; pause ;;
       0) ok "退出。"; exit 0 ;;
-      *) warn "无效选择"; pause ;;
+      *) warn "无效选择：$choice"; pause ;;
     esac
   done
 }
 
 # -------------------- 入口 --------------------
 case "${1:-}" in
-  install) self_install "$0" ;;   # 第一次下载后：sudo -i ./fzb.sh install
-  update)  self_update_from_github ;;  # 命令行更新：sudo fzb update
-  *)       menu_loop ;;           # 正常运行：sudo fzb
+  install) self_install "$0" ;;      # 第一次下载后：sudo -i ./fzb.sh install
+  update)  self_update_from_github ;;# 命令行更新：sudo fzb update
+  *)       menu_loop ;;              # 正常运行：sudo fzb
 esac
