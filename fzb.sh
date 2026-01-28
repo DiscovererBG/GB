@@ -10,10 +10,8 @@ INSTALL_DIR="/opt/${APP_NAME}"
 INSTALLED_SCRIPT="${INSTALL_DIR}/${APP_NAME}.sh"
 BIN_PATH="/usr/local/sbin/${APP_NAME}"
 
-# =========================
-# ✅ 你只需要改这一行（改成你自己的 GitHub Raw 地址）
-REPO_RAW_URL="https://raw.githubusercontent.com/你的用户名/你的仓库/main/fzb.sh"
-# =========================
+# ✅ 你的 GitHub Raw 地址（已替你填好）
+REPO_RAW_URL="https://raw.githubusercontent.com/DiscovererBG/GB/refs/heads/main/fzb.sh"
 
 # ---------- UI ----------
 c_green="\033[1;32m"; c_yellow="\033[1;33m"; c_red="\033[1;31m"; c_blue="\033[1;34m"; c_reset="\033[0m"
@@ -289,21 +287,14 @@ view_logs(){
   esac
 }
 
-# ----------------- 安装/更新逻辑（关键：默认不联网） -----------------
 self_install(){
   need_root
   mkdir -p "$INSTALL_DIR"
-  # 复制当前脚本到安装目录（不联网）
   local src="${1:-}"
   if [ -z "$src" ] || [ ! -f "$src" ]; then
-    # 尝试用 BASH_SOURCE 取当前脚本路径
     src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   fi
-
-  if [ ! -f "$src" ]; then
-    err "找不到脚本文件本体，无法安装。"
-    exit 1
-  fi
+  [ -f "$src" ] || { err "找不到脚本文件本体，无法安装。"; exit 1; }
 
   install -m 755 "$src" "$INSTALLED_SCRIPT"
   ln -sf "$INSTALLED_SCRIPT" "$BIN_PATH"
@@ -314,14 +305,7 @@ self_install(){
 
 self_update_from_github(){
   need_root
-  if ! has_cmd curl; then
-    err "缺少 curl，先安装 curl 再更新。"
-    exit 1
-  fi
-  if [ "$REPO_RAW_URL" = "https://raw.githubusercontent.com/你的用户名/你的仓库/main/fzb.sh" ]; then
-    err "你还没把 REPO_RAW_URL 改成你自己的仓库地址。"
-    exit 1
-  fi
+  has_cmd curl || { err "缺少 curl，先安装 curl 再更新。"; exit 1; }
 
   mkdir -p "$INSTALL_DIR"
   local ts; ts="$(timestamp)"
@@ -331,7 +315,6 @@ self_update_from_github(){
   curl -fL "$REPO_RAW_URL" -o "$tmp"
   chmod +x "$tmp"
 
-  # 备份旧版本
   if [ -f "$INSTALLED_SCRIPT" ]; then
     cp -a "$INSTALLED_SCRIPT" "${INSTALLED_SCRIPT}.bak.${ts}"
     ok "已备份旧版本 -> ${INSTALLED_SCRIPT}.bak.${ts}"
@@ -342,7 +325,6 @@ self_update_from_github(){
   ok "更新完成。"
 }
 
-# ---------- Menu ----------
 print_menu(){
   clear || true
   echo -e "${c_blue}================= fzb 工具箱（fail2ban）=================${c_reset}"
@@ -384,18 +366,8 @@ menu_loop(){
   done
 }
 
-# ---------- Entry ----------
 case "${1:-}" in
-  install)
-    # 你第一次下载到本地后跑：sudo -i bash ./fzb.sh install
-    self_install "$0"
-    ;;
-  update)
-    # 也支持命令行更新（同样会联网）：sudo fzb update
-    self_update_from_github
-    ;;
-  *)
-    # 正常运行：sudo fzb（不联网）
-    menu_loop
-    ;;
+  install) self_install "$0" ;;
+  update)  self_update_from_github ;;
+  *)       menu_loop ;;
 esac
