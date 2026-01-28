@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-#  fzb - Fail2ban 菜单式工具箱（单文件版 / 彩色美化版）
+#  fzb - Fail2ban 菜单式工具箱（单文件版 / 彩色美化增强版）
 # ---------------------------------------------------------
 # 目标：
 #   1) 下载一次 -> 本地 sudo fzb 就能调出菜单
@@ -94,7 +94,6 @@ detect_pkg_mgr(){
 }
 
 svc(){
-  # 用法：svc start|stop|restart|status|enable|disable
   local action="$1"
   if has_cmd systemctl; then
     case "$action" in
@@ -119,7 +118,6 @@ svc(){
 f2b_installed(){ has_cmd fail2ban-client; }
 
 detect_ssh_port(){
-  # 优先从监听端口推断，其次读取 sshd_config；最后默认 22
   local port=""
   if has_cmd ss; then
     port="$(ss -ltnp 2>/dev/null | awk "/sshd/ {print \$4}" | sed -n "s/.*:\([0-9][0-9]*\)$/\1/p" | head -n1 || true)"
@@ -130,25 +128,92 @@ detect_ssh_port(){
   echo "${port:-22}"
 }
 
-summary_line(){
-  # 顶部小摘要：端口 / 封禁数 / 白名单是否存在
-  local ssh_port="?"
-  ssh_port="$(detect_ssh_port || echo "?")"
+f2b_version(){
+  if ! f2b_installed; then echo "-"; return; fi
+  local v=""
+  v="$(fail2ban-client -V 2>/dev/null | head -n1 | sed 's/[^0-9.].*//g' || true)"
+  # 有些版本 -V 输出不一样，兜底用 fail2ban-server -V
+  if [ -z "$v" ] && has_cmd fail2ban-server; then
+    v="$(fail2ban-server -V 2>/dev/null | head -n1 | sed 's/[^0-9.].*//g' || true)"
+  fi
+  echo "${v:-?}"
+}
 
-  local banned_now="?"
-  if f2b_installed && fail2ban-client status sshd >/dev/null 2>&1; then
-    banned_now="$(fail2ban-client status sshd 2>/dev/null | awk -F': ' '/Currently banned/ {print $2}' | head -n1 || echo "0")"
-    [ -z "$banned_now" ] && banned_now="0"
+jail_count(){
+  if ! f2b_installed; then echo "-"; return; fi
+  local n=""
+  n="$(fail2ban-client status 2>/dev/null | awk -F': ' '/Number of jail/ {print $2}' | head -n1 || true)"
+  echo "${n:-0}"
+}
+
+sshd_banned_now(){
+  if ! f2b_installed; then echo "-"; return; fi
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    local n=""
+    n="$(fail2ban-client status sshd 2>/dev/null | awk -F': ' '/Currently banned/ {print $2}' | head -n1 || true)"
+    echo "${n:-0}"
   else
-    banned_now="-"
+    echo "-"
   fi
+}
 
-  local has_ignoreip="否"
-  if [ -f "$JAIL_LOCAL" ] && grep -qiE '^\s*ignoreip\s*=' "$JAIL_LOCAL"; then
-    has_ignoreip="是"
-  fi
+sshd_banned_24h(){
+  # 统计最近 24 小时 fail2ban.log 中与 sshd 封禁有关的次数（尽量兼容不同日志格式）
+  # 如果没有 fail2ban.log，则返回 "-"
+  local log="/var/log/fail2ban.log"
+  [ -f "$log" ] || { echo "-"; return; }
 
-  echo -e "${C_DIM}SSH端口:${C_RESET} ${C_BOLD}${ssh_port}${C_RESET}   ${C_DIM}当前封禁:${C_RESET} ${C_BOLD}${banned_now}${C_RESET}   ${C_DIM}已设置白名单(ignoreip):${C_RESET} ${C_BOLD}${has_ignoreip}${C_RESET}"
+  # GNU date 兼容：取 24h 前的 epoch
+  if ! has_cmd date; then echo "-"; return; fi
+  local since_epoch now_epoch
+  now_epoch="$(date +%s 2>/dev/null || echo "")"
+  [ -n "$now_epoch" ] || { echo "-"; return; }
+  since_epoch="$((now_epoch - 24*3600))"
+
+  # 解析常见日志格式：YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DDTHH:MM:SS
+  # 只统计 sshd 且包含 Ban 的行
+  # 注意：不同发行版日志可能略不同，这里做“尽力统计”，失败就返回 0
+  local cnt="0"
+  cnt="$(awk -v since="$since_epoch" '
+    function to_epoch(d, t,   cmd, r){
+      gsub(/T/," ",t)
+      cmd="date -d \"" d " " t "\" +%s 2>/dev/null"
+      cmd | getline r
+      close(cmd)
+      return r
+    }
+    {
+      # 例：2026-01-28 09:35:24,116 fail2ban.actions ...
+      # 或：2026-01-28T09:35:24 ...
+      date=$1
+      time=$2
+      gsub(/,.*/,"",time)
+      if (date ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && time ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/){
+        epoch=to_epoch(date, time)
+        if (epoch != "" && epoch+0 >= since+0){
+          if ($0 ~ /sshd/ && $0 ~ /Ban /) c++
+        }
+      }
+    }
+    END{ print c+0 }
+  ' "$log" 2>/dev/null || echo "0")"
+
+  echo "${cnt:-0}"
+}
+
+has_ignoreip(){
+  if [ -f "$JAIL_LOCAL" ] && grep -qiE '^\s*ignoreip\s*=' "$JAIL_LOCAL"; then echo "是"; else echo "否"; fi
+}
+
+summary_line(){
+  local ssh_port; ssh_port="$(detect_ssh_port || echo "?")"
+  local v; v="$(f2b_version)"
+  local j; j="$(jail_count)"
+  local bnow; bnow="$(sshd_banned_now)"
+  local b24; b24="$(sshd_banned_24h)"
+  local ign; ign="$(has_ignoreip)"
+
+  echo -e "${C_DIM}SSH端口:${C_RESET} ${C_BOLD}${ssh_port}${C_RESET}   ${C_DIM}F2B:${C_RESET} ${C_BOLD}${v}${C_RESET}   ${C_DIM}Jail:${C_RESET} ${C_BOLD}${j}${C_RESET}   ${C_DIM}封禁(现在/24h):${C_RESET} ${C_BOLD}${bnow}/${b24}${C_RESET}   ${C_DIM}白名单:${C_RESET} ${C_BOLD}${ign}${C_RESET}"
 }
 
 # -------------------- 备份 --------------------
@@ -412,7 +477,6 @@ self_install(){
   need_root
   mkdir -p "$INSTALL_DIR"
 
-  # 安装就是把“当前脚本文件”复制到 /opt/fzb/fzb.sh，并创建 fzb 命令软链接
   local src="${1:-}"
   if [ -z "$src" ] || [ ! -f "$src" ]; then
     src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -474,14 +538,12 @@ banner(){
 }
 
 menu_item(){
-  # menu_item "1" "安装 fail2ban"
   local key="$1"; shift
   local text="$*"
   printf "  %s%s%s) %s\n" "${C_CYAN}${C_BOLD}" "${key}" "${C_RESET}" "${text}"
 }
 
 menu_item2(){
-  # 二级/特殊键
   local key="$1"; shift
   local text="$*"
   printf "  %s%s%s  %s\n" "${C_YELLOW}${C_BOLD}" "${key}" "${C_RESET}" "${text}"
@@ -531,7 +593,7 @@ menu_loop(){
 
 # -------------------- 入口 --------------------
 case "${1:-}" in
-  install) self_install "$0" ;;      # 第一次下载后：sudo -i ./fzb.sh install
-  update)  self_update_from_github ;;# 命令行更新：sudo fzb update
-  *)       menu_loop ;;              # 正常运行：sudo fzb
+  install) self_install "$0" ;;
+  update)  self_update_from_github ;;
+  *)       menu_loop ;;
 esac
