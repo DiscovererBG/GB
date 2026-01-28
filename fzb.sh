@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =========================================================
-#  fzb - Fail2ban 菜单式工具箱（单文件版 / 彩色美化增强版）
+#  fzb - Fail2ban 菜单式工具箱（单文件版 / 全中文显示优先 / 彩色美化增强版）
 # ---------------------------------------------------------
-# 目标：
+# 设计原则：
 #   1) 下载一次 -> 本地 sudo fzb 就能调出菜单
 #   2) 默认不联网；只有“更新脚本”才访问 GitHub
 #   3) 只管理 fail2ban（安装/配置/白名单/封禁/日志/参数）
@@ -13,9 +13,9 @@
 #   - 备份：/root/fzb_backups/...
 #
 # 不会做的事：
-#   - 不改 sshd_config
-#   - 不改 UFW/Firewalld 的“配置文件”
-#   - fail2ban 封禁会动态写内核防火墙规则（这是正常行为）
+#   - 不改 sshd_config（你改 SSH 端口后需要在这里“写入/更新配置”同步到 fail2ban）
+#   - 不改 UFW/Firewalld 的配置文件
+#   - fail2ban 封禁会动态写内核防火墙规则（这是 fail2ban 正常工作方式）
 # =========================================================
 
 set -euo pipefail
@@ -94,6 +94,7 @@ detect_pkg_mgr(){
 }
 
 svc(){
+  # 用法：svc start|stop|restart|status|enable|disable
   local action="$1"
   if has_cmd systemctl; then
     case "$action" in
@@ -118,6 +119,7 @@ svc(){
 f2b_installed(){ has_cmd fail2ban-client; }
 
 detect_ssh_port(){
+  # 优先从监听端口推断，其次读取 sshd_config；最后默认 22
   local port=""
   if has_cmd ss; then
     port="$(ss -ltnp 2>/dev/null | awk "/sshd/ {print \$4}" | sed -n "s/.*:\([0-9][0-9]*\)$/\1/p" | head -n1 || true)"
@@ -132,18 +134,31 @@ f2b_version(){
   if ! f2b_installed; then echo "-"; return; fi
   local v=""
   v="$(fail2ban-client -V 2>/dev/null | head -n1 | sed 's/[^0-9.].*//g' || true)"
-  # 有些版本 -V 输出不一样，兜底用 fail2ban-server -V
   if [ -z "$v" ] && has_cmd fail2ban-server; then
     v="$(fail2ban-server -V 2>/dev/null | head -n1 | sed 's/[^0-9.].*//g' || true)"
   fi
   echo "${v:-?}"
 }
 
+# ✅ 修复点：顶部摘要不再“误显示 0”
+#   - 取不到就重试一次
+#   - 仍取不到就显示 ?（避免误导）
 jail_count(){
   if ! f2b_installed; then echo "-"; return; fi
+
   local n=""
   n="$(fail2ban-client status 2>/dev/null | awk -F': ' '/Number of jail/ {print $2}' | head -n1 || true)"
-  echo "${n:-0}"
+
+  if [ -z "${n:-}" ]; then
+    sleep 0.2
+    n="$(fail2ban-client status 2>/dev/null | awk -F': ' '/Number of jail/ {print $2}' | head -n1 || true)"
+  fi
+
+  if [ -z "${n:-}" ]; then
+    echo "?"
+  else
+    echo "$n"
+  fi
 }
 
 sshd_banned_now(){
@@ -158,21 +173,15 @@ sshd_banned_now(){
 }
 
 sshd_banned_24h(){
-  # 统计最近 24 小时 fail2ban.log 中与 sshd 封禁有关的次数（尽量兼容不同日志格式）
-  # 如果没有 fail2ban.log，则返回 "-"
+  # 统计最近 24 小时 fail2ban.log 中与 sshd 封禁有关的次数（尽力统计）
   local log="/var/log/fail2ban.log"
   [ -f "$log" ] || { echo "-"; return; }
 
-  # GNU date 兼容：取 24h 前的 epoch
-  if ! has_cmd date; then echo "-"; return; fi
-  local since_epoch now_epoch
+  local now_epoch since_epoch
   now_epoch="$(date +%s 2>/dev/null || echo "")"
   [ -n "$now_epoch" ] || { echo "-"; return; }
   since_epoch="$((now_epoch - 24*3600))"
 
-  # 解析常见日志格式：YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DDTHH:MM:SS
-  # 只统计 sshd 且包含 Ban 的行
-  # 注意：不同发行版日志可能略不同，这里做“尽力统计”，失败就返回 0
   local cnt="0"
   cnt="$(awk -v since="$since_epoch" '
     function to_epoch(d, t,   cmd, r){
@@ -183,8 +192,6 @@ sshd_banned_24h(){
       return r
     }
     {
-      # 例：2026-01-28 09:35:24,116 fail2ban.actions ...
-      # 或：2026-01-28T09:35:24 ...
       date=$1
       time=$2
       gsub(/,.*/,"",time)
@@ -202,25 +209,27 @@ sshd_banned_24h(){
 }
 
 has_ignoreip(){
-  if [ -f "$JAIL_LOCAL" ] && grep -qiE '^\s*ignoreip\s*=' "$JAIL_LOCAL"; then echo "是"; else echo "否"; fi
+  if [ -f "$JAIL_LOCAL" ] && grep -qiE '^\s*ignoreip\s*=' "$JAIL_LOCAL"; then echo "已设置"; else echo "未设置"; fi
 }
 
 summary_line(){
-  local ssh_port; ssh_port="$(detect_ssh_port || echo "?")"
-  local v; v="$(f2b_version)"
-  local j; j="$(jail_count)"
-  local bnow; bnow="$(sshd_banned_now)"
-  local b24; b24="$(sshd_banned_24h)"
-  local ign; ign="$(has_ignoreip)"
+  local ssh_port v j bnow b24 ign
+  ssh_port="$(detect_ssh_port || echo "?")"
+  v="$(f2b_version)"
+  j="$(jail_count)"
+  bnow="$(sshd_banned_now)"
+  b24="$(sshd_banned_24h)"
+  ign="$(has_ignoreip)"
 
-  echo -e "${C_DIM}SSH端口:${C_RESET} ${C_BOLD}${ssh_port}${C_RESET}   ${C_DIM}F2B:${C_RESET} ${C_BOLD}${v}${C_RESET}   ${C_DIM}Jail:${C_RESET} ${C_BOLD}${j}${C_RESET}   ${C_DIM}封禁(现在/24h):${C_RESET} ${C_BOLD}${bnow}/${b24}${C_RESET}   ${C_DIM}白名单:${C_RESET} ${C_BOLD}${ign}${C_RESET}"
+  echo -e "${C_DIM}SSH端口:${C_RESET} ${C_BOLD}${ssh_port}${C_RESET}   ${C_DIM}Fail2ban:${C_RESET} ${C_BOLD}${v}${C_RESET}   ${C_DIM}规则组:${C_RESET} ${C_BOLD}${j}${C_RESET}   ${C_DIM}封禁(现在/24h):${C_RESET} ${C_BOLD}${bnow}/${b24}${C_RESET}   ${C_DIM}白名单:${C_RESET} ${C_BOLD}${ign}${C_RESET}"
 }
 
 # -------------------- 备份 --------------------
 backup_f2b(){
   ensure_dirs
-  local ts; ts="$(timestamp)"
-  local dst="${BACKUP_DIR}/fail2ban_${ts}"
+  local ts dst
+  ts="$(timestamp)"
+  dst="${BACKUP_DIR}/fail2ban_${ts}"
   mkdir -p "$dst"
   if [ -d "$F2B_DIR" ]; then
     cp -a "$F2B_DIR" "$dst/" 2>/dev/null || true
@@ -256,12 +265,12 @@ install_fail2ban(){
   ok "fail2ban 安装完成。"
 }
 
-# -------------------- 写入/更新 jail.local --------------------
+# -------------------- 写入/更新 jail.local（启用 sshd 防爆破） --------------------
 write_jail_local(){
   local ssh_port; ssh_port="$(detect_ssh_port)"
   echo
   info "检测到 SSH 端口：${C_BOLD}${ssh_port}${C_RESET}"
-  read -r -p "是否使用这个端口作为防爆破保护端口？[Y/n] " yn || true
+  read -r -p "是否使用这个端口作为 SSH 防爆破保护端口？[Y/n] " yn || true
   yn="${yn:-Y}"
   if [[ "$yn" =~ ^[Nn]$ ]]; then
     read -r -p "请输入你的 SSH 端口（例如 22 或 26463）: " ssh_port
@@ -271,14 +280,15 @@ write_jail_local(){
   echo
   info "下面是防爆破参数（回车=使用默认值）"
   local bantime="1h" findtime="10m" maxretry="5" mode="aggressive"
-  read -r -p "bantime（封禁时长，默认 1h）: " v || true; bantime="${v:-$bantime}"
-  read -r -p "findtime（统计窗口，默认 10m）: " v || true; findtime="${v:-$findtime}"
-  read -r -p "maxretry（失败次数，默认 5）: " v || true; maxretry="${v:-$maxretry}"
-  read -r -p "mode（normal/aggressive，默认 aggressive）: " v || true; mode="${v:-$mode}"
+  read -r -p "封禁时长 bantime（默认 1h）: " v || true; bantime="${v:-$bantime}"
+  read -r -p "统计窗口 findtime（默认 10m）: " v || true; findtime="${v:-$findtime}"
+  read -r -p "失败次数 maxretry（默认 5）: " v || true; maxretry="${v:-$maxretry}"
+  read -r -p "强度 mode（normal/aggressive，默认 aggressive）: " v || true; mode="${v:-$mode}"
 
   backup_f2b
   mkdir -p "$F2B_DIR"
 
+  # 说明：这里会覆盖写入 jail.local（更直观、最不易出错）
   cat > "$JAIL_LOCAL" <<EOF
 [DEFAULT]
 # 封禁时长：例如 30m / 1h / 24h
@@ -287,53 +297,53 @@ bantime  = ${bantime}
 findtime = ${findtime}
 # 在统计窗口内失败多少次就封
 maxretry = ${maxretry}
-# systemd 日志后端（Debian/Ubuntu 等最常见）
+# systemd 日志后端（Debian/Ubuntu 常见）
 backend  = systemd
 
 [sshd]
 enabled  = true
-# 这里一定要填你真实 SSH 端口（脚本已帮你检测/询问）
+# SSH 实际端口（脚本已检测/询问）
 port     = ${ssh_port}
 # aggressive 更严格；normal 更温和（误封概率更低）
 mode     = ${mode}
 EOF
 
-  ok "已写入 ${JAIL_LOCAL}"
+  ok "已写入配置：${JAIL_LOCAL}"
   svc enable
   svc restart
   ok "fail2ban 已启用并重启。"
 }
 
-# -------------------- 状态/校验 --------------------
-ensure_sshd_jail(){
-  if [ ! -f "$JAIL_LOCAL" ]; then warn "$JAIL_LOCAL 不存在：先执行“写入/更新配置”。"; return 1; fi
-  if ! grep -qi "^\[sshd\]" "$JAIL_LOCAL"; then warn "$JAIL_LOCAL 没有 [sshd]：先写入/更新配置。"; return 1; fi
+ensure_sshd_group(){
+  if [ ! -f "$JAIL_LOCAL" ]; then warn "${JAIL_LOCAL} 不存在：请先执行“写入/更新配置”。"; return 1; fi
+  if ! grep -qi "^\[sshd\]" "$JAIL_LOCAL"; then warn "${JAIL_LOCAL} 中没有 [sshd]：请先写入/更新配置。"; return 1; fi
   return 0
 }
 
+# -------------------- 查看状态（服务 + 规则组） --------------------
 show_status(){
   if ! f2b_installed; then err "fail2ban 未安装。"; return; fi
   echo
-  info "service 状态："
+  info "【服务状态】fail2ban.service："
   svc status
   echo
-  info "fail2ban 总状态："
+  info "【总状态】当前启用的规则组（fail2ban 原始输出）："
   fail2ban-client status || true
   echo
-  info "sshd jail 状态："
+  info "【sshd 规则组状态】（fail2ban 原始输出）："
   fail2ban-client status sshd || true
 }
 
 # -------------------- 封禁/解封/查看封禁 --------------------
 show_banned(){
-  ensure_sshd_jail || return
+  ensure_sshd_group || return
   echo
-  info "sshd 封禁情况："
+  info "【sshd 规则组】封禁情况（原始输出）："
   fail2ban-client status sshd || true
 }
 
 ban_ip(){
-  ensure_sshd_jail || return
+  ensure_sshd_group || return
   read -r -p "输入要封禁的 IP: " ip
   [ -z "${ip:-}" ] && { warn "IP 不能为空"; return; }
   fail2ban-client set sshd banip "$ip" || { err "封禁失败"; return; }
@@ -341,7 +351,7 @@ ban_ip(){
 }
 
 unban_ip(){
-  ensure_sshd_jail || return
+  ensure_sshd_group || return
   read -r -p "输入要解封的 IP: " ip
   [ -z "${ip:-}" ] && { warn "IP 不能为空"; return; }
   fail2ban-client set sshd unbanip "$ip" || { err "解封失败"; return; }
@@ -352,31 +362,31 @@ unban_ip(){
 show_whitelist(){
   if ! f2b_installed; then err "fail2ban 未安装。"; return; fi
   echo
-  info "【运行时】sshd jail 当前生效的 ignoreip 白名单："
+  info "【运行时生效】sshd 规则组 ignoreip 白名单："
   if fail2ban-client get sshd ignoreip >/dev/null 2>&1; then
     fail2ban-client get sshd ignoreip || true
   else
-    warn "暂时无法读取运行时 ignoreip（可能 sshd jail 未加载或版本差异）。"
+    warn "读取运行时 ignoreip 失败（可能 sshd 规则组未加载或版本差异）。"
   fi
 
   echo
-  info "【配置文件】jail.local 里的 ignoreip："
+  info "【配置文件】${JAIL_LOCAL} 中的 ignoreip："
   if [ -f "$JAIL_LOCAL" ]; then
     grep -nEi '^\s*ignoreip\s*=' "$JAIL_LOCAL" 2>/dev/null || echo "(未设置)"
   else
-    echo "(jail.local 不存在)"
+    echo "(${JAIL_LOCAL} 不存在)"
   fi
 }
 
 set_whitelist(){
-  ensure_sshd_jail || return
+  ensure_sshd_group || return
 
   echo
   info "当前配置文件里的 ignoreip："
   grep -nEi '^\s*ignoreip\s*=' "$JAIL_LOCAL" 2>/dev/null || echo "(未设置)"
 
   hr
-  echo "请输入要加入白名单的 IP / 网段（空格分隔），例如："
+  echo "请输入要加入白名单的 IP/网段（空格分隔），例如："
   echo "  127.0.0.1/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
   echo
   read -r -p "ignoreip = " add
@@ -408,12 +418,12 @@ set_whitelist(){
 
 # -------------------- 一键调参（温和/默认/狠点） --------------------
 tune_params_quick(){
-  ensure_sshd_jail || return
+  ensure_sshd_group || return
   echo
-  echo "请选择预设（只改 DEFAULT 的 3 个参数，不改其它）："
-  echo "  1) 温和（更不容易误封自己）: maxretry=8  findtime=10m  bantime=30m"
-  echo "  2) 默认（平衡）            : maxretry=5  findtime=10m  bantime=1h"
-  echo "  3) 狠点（更强力）          : maxretry=3  findtime=5m   bantime=24h"
+  echo "请选择预设（只改 [DEFAULT] 的 3 个参数，不改其它）："
+  echo "  1) 温和（更不易误封）: maxretry=8  findtime=10m  bantime=30m"
+  echo "  2) 默认（平衡）      : maxretry=5  findtime=10m  bantime=1h"
+  echo "  3) 狠点（更强力）    : maxretry=3  findtime=5m   bantime=24h"
   read -r -p "选择 [1/2/3]: " n
 
   local bantime findtime maxretry
@@ -453,10 +463,10 @@ tune_params_quick(){
 view_logs(){
   if ! f2b_installed; then err "fail2ban 未安装。"; return; fi
   echo
-  echo "选择日志查看："
-  echo "  1) journalctl -u fail2ban（最近 200 行）"
+  echo "选择要查看的日志："
+  echo "  1) fail2ban 服务日志（journalctl，最近 200 行）"
   echo "  2) /var/log/fail2ban.log（最近 200 行）"
-  echo "  3) SSH 登录日志（/var/log/auth.log 或 /var/log/secure，最近 200 行）"
+  echo "  3) SSH 登录日志（auth.log 或 secure，最近 200 行）"
   read -r -p "选择 [1/2/3]: " n
 
   case "$n" in
@@ -495,19 +505,20 @@ self_install(){
 # -------------------- 更新脚本（唯一联网项） --------------------
 self_update_from_github(){
   need_root
-  has_cmd curl || { err "缺少 curl，先安装 curl 再更新。"; exit 1; }
+  has_cmd curl || { err "缺少 curl，请先安装 curl 再更新。"; exit 1; }
 
   mkdir -p "$INSTALL_DIR"
-  local ts; ts="$(timestamp)"
-  local tmp="/tmp/${APP_NAME}.sh.${ts}"
+  local ts tmp
+  ts="$(timestamp)"
+  tmp="/tmp/${APP_NAME}.sh.${ts}"
 
   echo
-  warn "即将联网从 GitHub 拉取最新脚本："
+  warn "即将联网从 GitHub 拉取最新脚本（唯一联网动作）："
   echo -e "  ${C_DIM}${REPO_RAW_URL}${C_RESET}"
   read -r -p "确认更新？输入 YES 继续: " yn
   [ "${yn:-}" = "YES" ] || { warn "取消更新。"; return; }
 
-  info "开始下载更新（仅此动作联网）..."
+  info "开始下载更新..."
   curl -fL "$REPO_RAW_URL" -o "$tmp"
   chmod +x "$tmp"
 
@@ -552,15 +563,15 @@ menu_item2(){
 print_menu(){
   banner
   menu_item "1"  "安装 fail2ban"
-  menu_item "2"  "写入/更新 jail.local（启用 sshd 防爆破）"
-  menu_item "3"  "查看状态（service + jail）"
-  menu_item "4"  "查看封禁列表（sshd）"
-  menu_item "5"  "手动封禁 IP（sshd）"
-  menu_item "6"  "手动解封 IP（sshd）"
-  menu_item "7"  "查看白名单 ignoreip（sshd）"
-  menu_item "8"  "设置/追加白名单 ignoreip（sshd）"
+  menu_item "2"  "写入/更新配置 jail.local（启用 SSH 防爆破）"
+  menu_item "3"  "查看状态（服务 + 规则组）"
+  menu_item "4"  "查看封禁列表（sshd 规则组）"
+  menu_item "5"  "手动封禁 IP（sshd 规则组）"
+  menu_item "6"  "手动解封 IP（sshd 规则组）"
+  menu_item "7"  "查看白名单 ignoreip（sshd 规则组）"
+  menu_item "8"  "设置/追加白名单 ignoreip（sshd 规则组）"
   menu_item "9"  "一键调参（温和/默认/狠点）"
-  menu_item "10" "查看日志（fail2ban / ssh）"
+  menu_item "10" "查看日志（fail2ban / SSH）"
   hr
   menu_item2 "u" "更新脚本（唯一联网项）"
   menu_item2 "0" "退出"
@@ -593,7 +604,7 @@ menu_loop(){
 
 # -------------------- 入口 --------------------
 case "${1:-}" in
-  install) self_install "$0" ;;
-  update)  self_update_from_github ;;
-  *)       menu_loop ;;
+  install) self_install "$0" ;;     # 第一次下载后：sudo -i ./fzb.sh install
+  update)  self_update_from_github ;;# 命令行更新：sudo fzb update
+  *)       menu_loop ;;             # 正常运行：sudo fzb
 esac
