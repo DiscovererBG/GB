@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# VPS 一键体检（稳定修复版）
-# - 修复：bash 语法错误（local ok()）
-# - 9 全跑不中断；R 真后台静默全跑
-# - 进度条：彩色块 + 灰点 '.'（避免 ???）
-# - 修复：awk 报错/丢包显示 loss%/403000/301/302 判定/dd 假速度/颜色丢失/ANSI 残留
-# - 最终总结：基础信息全中文 + 自动识别国家中文
 
 # ---------------- Locale ----------------
 if command -v locale >/dev/null 2>&1; then
@@ -306,7 +300,7 @@ ping_one() {
   local rttline
   rttline="$(printf "%s\n" "$out" | grep -E 'rtt |round-trip ' | tail -n1 || true)"
   if [[ -n "$rttline" ]]; then
-    read -r min avg max mdev < <(printf "%s\n" "$rttline" | sed -E 's/.*= ([0-9.]+)\/([0-9.]+)\/([0-9.]+)\/([0-9.]+).*/\1 \2 \3 \4/' || true)
+    read -r min avg max mdev < <(printf "%s\n" "$rttline" | sed -E 's/.*= ([0-9.]+)\/([0-9.]+)\/([0-9.]+)\/([0-9.]+).*/\1 \2 \3 \4/' || true) || true
   else
     min=""; avg=""; max=""; mdev=""
   fi
@@ -485,7 +479,7 @@ do_dd() {
   time_s="$(printf "%s\n" "$out" | sed -n 's/.*copied, \([0-9.]\+\) s.*/\1/p' | tail -n1 || true)"
   read -r speed_val speed_unit < <(printf "%s\n" "$out" \
     | sed -n 's/.*copied, [0-9.]\+ s, \([0-9.]\+\) \([kMG]B\/s\).*/\1 \2/p' \
-    | tail -n1 || true)
+    | tail -n1 || true) || true
 
   if [[ -n "${speed_val:-}" && -n "${speed_unit:-}" ]]; then
     if [[ "$speed_unit" == "GB/s" ]]; then
@@ -602,7 +596,9 @@ tcp_test_one() {
     return 0
   fi
 
-  read -r tls ttfb dl code <<<"$w"
+  # ✅ 修复点：read 失败不能触发 set -e 退出
+  read -r tls ttfb dl code <<<"$w" || true
+
   code="$(printf "%s" "${code:-000}" | tr -cd '0-9' | head -c 3)"
   [[ -z "$code" ]] && code="000"
 
@@ -646,7 +642,10 @@ do_tcp() {
   local line src st tls ttfb dl code
   for src in "${TCP_SOURCES[@]}"; do
     line="$(tcp_test_one "$src" || true)"
-    read -r src st tls ttfb dl code <<<"$line"
+
+    # ✅ 修复点：字段不足 read 返回非0 会触发 set -e 退出脚本
+    read -r src st tls ttfb dl code <<<"$line" || true
+    st="${st:-FAIL}"; tls="${tls:-}"; ttfb="${ttfb:-}"; dl="${dl:-}"; code="${code:-}"
 
     if [[ "$st" == "OK" && -n "${dl:-}" ]]; then
       ((TCP_OK_SAMPLES++))
