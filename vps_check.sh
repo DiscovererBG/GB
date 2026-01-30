@@ -3,19 +3,29 @@
 # VPS Health + Streaming Check (Read-only) - Menu Edition
 # - 交互菜单：可选跑 System / IP / Ping / MTR / Disk / Streaming
 # - 修复：dd 速度输出（不再 unknown）
+# - 修复：MTR lastLoss / lastAvg 解析（总评不再出现 ?% / 100ms 错位）
 # - 增强：ping 间隔失败自动降级；数值解析更稳
-# - 最后：给出整体评分 + 结论摘要（适合贴到网上）
+# - 最后：输出漂亮的总结报告（适合贴到网上/截图）
 #
 # Usage:
-#   bash <(curl -fsSL "https://raw.githubusercontent.com/DiscovererBG/GB/refs/heads/main/vps_check.sh")
-#   或保存到本地：chmod +x vps_check.sh && ./vps_check.sh
+
+#   ./vps_check.sh
+#   ./vps_check.sh --redact   # 打码模式：隐藏 Host / IPv4
 #
 # NOTE:
-# - 只读检测，不改系统配置（除非你在菜单里选择“安装mtr”）
+# - 默认只读检测，不改系统配置（除非你在菜单选择“安装 mtr”）
 # - 流媒体解锁为 best-effort（最终以登录播放为准）
 # =========================================================
 
 set -euo pipefail
+
+# ---------- args ----------
+REDACT=0
+for a in "${@:-}"; do
+  case "$a" in
+    --redact) REDACT=1 ;;
+  esac
+done
 
 # ---------- UI ----------
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; CYAN="\033[36m"; GRAY="\033[90m"; NC="\033[0m"
@@ -41,6 +51,27 @@ safe_num() { local x="${1:-}"; if is_number "$x"; then echo "$x"; else echo ""; 
 f_le() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a<=b)?0:1}'; }
 f_lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a<b)?0:1}'; }
 f_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a>=b)?0:1}'; }
+
+# ---------- redact helpers ----------
+mask_ip() {
+  local ip="${1:-}"
+  if [[ -z "$ip" || "$ip" == "unknown" ]]; then echo "$ip"; return 0; fi
+  # IPv4: a.b.c.d -> a.b.*.*
+  if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "$ip" | awk -F. '{print $1"."$2".*.*"}'
+    return 0
+  fi
+  echo "***"
+}
+mask_host() {
+  local h="${1:-}"
+  if [[ -z "$h" || "$h" == "unknown" ]]; then echo "$h"; return 0; fi
+  # 保留前 2 字符
+  local p="${h:0:2}"
+  echo "${p}***"
+}
+
+pause() { read -r -p "回车继续..." _ || true; }
 
 # ---------- global state for summary ----------
 RUN_SYS=0 RUN_IP=0 RUN_PING=0 RUN_MTR=0 RUN_DISK=0 RUN_STREAM=0
@@ -76,8 +107,6 @@ TT_OK="unknown"
 PV_OK="unknown"
 MX_OK="unknown"
 
-pause() { read -r -p "回车继续..." _ || true; }
-
 set_targets() {
   echo
   read -r -p "输入你要测试的目标（空格分隔，留空=默认 1.1.1.1 8.8.8.8 www.google.com）: " input || true
@@ -104,6 +133,7 @@ gather_system() {
   VIRT_="unknown"
   if need_cmd systemd-detect-virt; then VIRT_="$(systemd-detect-virt 2>/dev/null || echo none)"; fi
   DISKROOT_="$(df -hP / 2>/dev/null | tail -n 1 | awk '{print $3"/"$2" ("$5")"}' || echo unknown)"
+
   echo -e "${BLUE}--- 基本信息 ---${NC}"
   echo "Host      : ${HOSTNAME_}"
   echo "OS        : ${OS_}"
@@ -124,15 +154,20 @@ gather_ip() {
     bad "缺少 curl，无法查询公网信息。"
     return 0
   fi
+
   local ip json
   ip="$(curl -4 -s --max-time 6 ifconfig.me 2>/dev/null || true)"
   [[ -n "${ip:-}" ]] && IPV4_="$ip"
-  json="$(curl -4 -s --max-time 6 "http://ip-api.com/json/${IPV4_}?fields=status,country,regionName,city,isp,as,query" 2>/dev/null || true)"
-  if echo "$json" | grep -q '"status":"success"'; then
-    GEO_="$(echo "$json" | sed -n 's/.*"country":"\([^"]*\)".*"regionName":"\([^"]*\)".*"city":"\([^"]*\)".*/\1, \2, \3/p')"
-    ASN_="$(echo "$json" | sed -n 's/.*"as":"\([^"]*\)".*/\1/p')"
-    ORG_="$(echo "$json" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+
+  if [[ "$IPV4_" != "unknown" ]]; then
+    json="$(curl -4 -s --max-time 6 "http://ip-api.com/json/${IPV4_}?fields=status,country,regionName,city,isp,as,query" 2>/dev/null || true)"
+    if echo "$json" | grep -q '"status":"success"'; then
+      GEO_="$(echo "$json" | sed -n 's/.*"country":"\([^"]*\)".*"regionName":"\([^"]*\)".*"city":"\([^"]*\)".*/\1, \2, \3/p')"
+      ASN_="$(echo "$json" | sed -n 's/.*"as":"\([^"]*\)".*/\1/p')"
+      ORG_="$(echo "$json" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+    fi
   fi
+
   echo -e "${BLUE}--- 公网信息 ---${NC}"
   echo "IPv4      : ${IPV4_}"
   echo "Geo       : ${GEO_}"
@@ -240,14 +275,19 @@ run_mtr() {
 
   local out last_line last_loss last_avg
   out="$(mtr -rwzbc "${MTR_COUNT}" "$target" 2>/dev/null || true)"
+
   echo "$out" | head -n 3
   echo -e "${GRAY}...（中间省略）...${NC}"
   echo "$out" | tail -n 5
 
   last_line="$(echo "$out" | tail -n 1)"
-  last_loss="$(echo "$last_line" | awk '{print $3}' | tr -d '%')"
-  last_avg="$(echo "$last_line" | awk '{print $6}')"
-  last_loss="$(safe_num "$last_loss")"; last_avg="$(safe_num "$last_avg")"
+
+  # ✅ 修复：从行尾倒数取字段，更稳
+  # 最后 7 列固定是：Loss% Snt Last Avg Best Wrst StDev
+  last_loss="$(echo "$last_line" | awk '{print $(NF-6)}' | tr -d '%')"
+  last_avg="$(echo "$last_line"  | awk '{print $(NF-3)}')"
+  last_loss="$(safe_num "$last_loss")"
+  last_avg="$(safe_num "$last_avg")"
 
   MTR_LASTLOSS="${last_loss:-}"
   MTR_LASTAVG="${last_avg:-}"
@@ -279,7 +319,6 @@ run_disk() {
 
   local tmp out speed mbps unit
   tmp="/tmp/vps_disk_test.$$"
-  # 关键：不要用 status=none，否则拿不到速度行
   out="$(dd if=/dev/zero of="$tmp" bs=1M count="${DISK_TEST_MB}" conv=fdatasync 2>&1 || true)"
   rm -f "$tmp" >/dev/null 2>&1 || true
 
@@ -290,6 +329,7 @@ run_disk() {
   mbps="$(echo "$DISK_SPEED_RAW" | awk '{print $1}' 2>/dev/null || true)"
   unit="$(echo "$DISK_SPEED_RAW" | awk '{print $2}' 2>/dev/null || true)"
   mbps="$(safe_num "$mbps")"
+
   if [[ -n "${mbps:-}" && -n "${unit:-}" ]]; then
     if [[ "$unit" == "GB/s" ]]; then mbps="$(awk -v x="$mbps" 'BEGIN{printf "%.2f", x*1024}')" ; fi
     DISK_MBPS="$mbps"
@@ -431,32 +471,47 @@ run_streaming() {
   hr
 }
 
-# ---------- overall summary ----------
+# ---------- pretty summary ----------
 overall_summary() {
-  echo -e "${BLUE}========================= 总结报告 =========================${NC}"
+  echo
+  echo -e "${BLUE}====================== ✅ VPS 体检总结报告 ======================${NC}"
 
-  # scoring
-  # network score based on ping + mtr
+  grade() {
+    local x="$1"
+    if [[ "$x" -ge 85 ]]; then echo "优秀"
+    elif [[ "$x" -ge 70 ]]; then echo "良好"
+    elif [[ "$x" -ge 55 ]]; then echo "一般"
+    else echo "偏弱"
+    fi
+  }
+  tag_by_grade() {
+    local g="$1"
+    case "$g" in
+      优秀) echo -e "${GREEN}✅${NC}" ;;
+      良好) echo -e "${GREEN}✅${NC}" ;;
+      一般) echo -e "${YELLOW}⚠️${NC}" ;;
+      *)    echo -e "${RED}❌${NC}" ;;
+    esac
+  }
+
+  # ---------- scoring ----------
   local net_score=0 disk_score=0 stream_score=0 total=0
   local net_grade="未知" disk_grade="未知" stream_grade="未知" overall=""
 
-  # Ping contribution
+  # Network score (Ping)
   if [[ "$RUN_PING" -eq 1 ]]; then
-    # good=2, warn=1, bad=0 (avg)
     local denom="$PING_TOTAL_TARGETS"
     [[ "$denom" -lt 1 ]] && denom=1
     net_score="$(awk -v g="$PING_GOOD" -v w="$PING_WARN" -v d="$denom" 'BEGIN{printf "%.0f", (g*2+w*1)*50/d }')"
-    # 0..100
   else
     net_score=0
   fi
 
   # MTR adjust
   if [[ "$RUN_MTR" -eq 1 ]]; then
-    if [[ "$MTR_RATING" == "GOOD" ]]; then net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x+10}')" ; fi
-    if [[ "$MTR_RATING" == "BAD" ]]; then  net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x-10}')" ; fi
+    [[ "$MTR_RATING" == "GOOD" ]] && net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x+10}')" || true
+    [[ "$MTR_RATING" == "BAD"  ]] && net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x-10}')" || true
   fi
-  # clamp
   net_score="$(awk -v x="$net_score" 'BEGIN{if(x<0)x=0; if(x>100)x=100; printf "%.0f", x}')"
 
   # Disk score
@@ -470,7 +525,7 @@ overall_summary() {
     disk_score=0
   fi
 
-  # Streaming score (rough)
+  # Streaming score
   if [[ "$RUN_STREAM" -eq 1 ]]; then
     local s=0
     [[ "$YT_OK" == "OK" ]] && ((s+=15)) || true
@@ -479,31 +534,18 @@ overall_summary() {
     [[ "$PV_OK" == "OK" ]] && ((s+=10)) || true
     [[ "$MX_OK" == "OK" ]] && ((s+=10)) || true
     [[ "$TT_OK" == "OK" ]] && ((s+=10)) || true
-    # 动画疯：OK 加分，REGION_BLOCK 不加分（但不扣分）
     [[ "$AG_STATUS" == "OK" ]] && ((s+=15)) || true
-    stream_score="$s" # 0..90-ish
-    # normalize to 0..100
-    stream_score="$(awk -v x="$stream_score" 'BEGIN{printf "%.0f", x*100/90}')"
+    stream_score="$(awk -v x="$s" 'BEGIN{printf "%.0f", x*100/90}')"
   else
     stream_score=0
   fi
 
-  # grades
-  grade() {
-    local x="$1"
-    if [[ "$x" -ge 85 ]]; then echo "优秀"
-    elif [[ "$x" -ge 70 ]]; then echo "良好"
-    elif [[ "$x" -ge 55 ]]; then echo "一般"
-    else echo "偏弱"
-    fi
-  }
   net_grade="$(grade "$net_score")"
   disk_grade="$(grade "$disk_score")"
   stream_grade="$(grade "$stream_score")"
 
-  # total (weights: net 50, disk 20, stream 30; missing parts don't penalize too hard)
-  local w_net=50 w_disk=20 w_stream=30
-  local used=0
+  # total weight
+  local w_net=50 w_disk=20 w_stream=30 used=0
   total=0
   if [[ "$RUN_PING" -eq 1 ]]; then total="$(awk -v t="$total" -v x="$net_score" -v w="$w_net" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_net)) || true; fi
   if [[ "$RUN_DISK" -eq 1 ]]; then total="$(awk -v t="$total" -v x="$disk_score" -v w="$w_disk" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_disk)) || true; fi
@@ -515,54 +557,81 @@ overall_summary() {
   fi
   overall="$(grade "$total")"
 
+  # redact output only (不影响内部检测)
+  local OUT_HOST="$HOSTNAME_" OUT_IP="$IPV4_"
+  if [[ "$REDACT" -eq 1 ]]; then
+    OUT_HOST="$(mask_host "$HOSTNAME_")"
+    OUT_IP="$(mask_ip "$IPV4_")"
+  fi
+
   echo -e "${BLUE}【基础信息】${NC}"
-  [[ "$RUN_SYS" -eq 1 ]] && echo "Host=${HOSTNAME_} | OS=${OS_} | Kernel=${KERNEL_} | Virt=${VIRT_} | CPU=${CPU_} | RAM=${RAM_} | Disk(/)=${DISKROOT_}" || echo "（未执行）"
-  [[ "$RUN_IP" -eq 1 ]] && echo "IPv4=${IPV4_} | Geo=${GEO_} | ASN=${ASN_} | ISP=${ORG_}" || echo "公网信息：未执行"
+  if [[ "$RUN_SYS" -eq 1 ]]; then
+    echo "  Host : ${OUT_HOST}"
+    echo "  OS   : ${OS_}"
+    echo "  Kern : ${KERNEL_} | Virt=${VIRT_}"
+    echo "  CPU  : ${CPU_} (${CORES_} cores) | RAM=${RAM_} | Disk(/)=${DISKROOT_}"
+  else
+    echo "  （未执行）"
+  fi
+  if [[ "$RUN_IP" -eq 1 ]]; then
+    echo "  IPv4 : ${OUT_IP}"
+    echo "  Geo  : ${GEO_}"
+    echo "  ASN  : ${ASN_}"
+    echo "  ISP  : ${ORG_}"
+  else
+    echo "  公网信息：未执行"
+  fi
   hr
 
-  echo -e "${BLUE}【网络】${NC}"
+  echo -e "${BLUE}【网络】${NC}  $(tag_by_grade "$net_grade")  ${net_score}/100（${net_grade}）"
   if [[ "$RUN_PING" -eq 1 ]]; then
-    echo "Ping：GOOD=${PING_GOOD} WARN=${PING_WARN} BAD=${PING_BAD} | worstLoss=${PING_WORST_LOSS:-?}% worstAvg=${PING_WORST_AVG:-?}ms"
+    echo "  Ping : GOOD=${PING_GOOD} WARN=${PING_WARN} BAD=${PING_BAD} | worstLoss=${PING_WORST_LOSS:-?}% | worstAvg=${PING_WORST_AVG:-?}ms"
   else
-    echo "Ping：未执行"
+    echo "  Ping : 未执行"
   fi
   if [[ "$RUN_MTR" -eq 1 ]]; then
-    echo "MTR：target=${TARGETS[0]} | lastLoss=${MTR_LASTLOSS:-?}% lastAvg=${MTR_LASTAVG:-?}ms | rating=${MTR_RATING}"
+    echo "  MTR  : target=${TARGETS[0]} | lastLoss=${MTR_LASTLOSS:-?}% | lastAvg=${MTR_LASTAVG:-?}ms | rating=${MTR_RATING}"
   else
-    echo "MTR：未执行"
+    echo "  MTR  : 未执行"
   fi
-  echo "网络评分：${net_score}/100（${net_grade}）"
   hr
 
-  echo -e "${BLUE}【磁盘】${NC}"
+  echo -e "${BLUE}【磁盘】${NC}  $(tag_by_grade "$disk_grade")  ${disk_score}/100（${disk_grade}）"
   if [[ "$RUN_DISK" -eq 1 ]]; then
-    echo "dd：${DISK_SPEED_RAW} | approx=${DISK_MBPS:-?} MB/s | rating=${DISK_RATING}"
-    echo "磁盘评分：${disk_score}/100（${disk_grade}）"
+    echo "  dd   : ${DISK_SPEED_RAW} | approx=${DISK_MBPS:-?} MB/s | rating=${DISK_RATING}"
   else
-    echo "未执行"
+    echo "  未执行"
   fi
   hr
 
-  echo -e "${BLUE}【流媒体】${NC}"
+  echo -e "${BLUE}【流媒体】${NC}  $(tag_by_grade "$stream_grade")  ${stream_score}/100（${stream_grade}）"
   if [[ "$RUN_STREAM" -eq 1 ]]; then
-    echo "YouTube=${YT_OK} (CC=${YT_CC}) | 动画疯=${AG_STATUS} | Netflix=${NF_OK} | Disney+=${DP_OK} | TikTok=${TT_OK} | Prime=${PV_OK} | Max=${MX_OK}"
-    echo "流媒体评分：${stream_score}/100（${stream_grade}）"
+    echo "  YouTube : ${YT_OK} (CC=${YT_CC})"
+    echo "  AniGamer: ${AG_STATUS}"
+    echo "  Netflix : ${NF_OK} | Disney+ : ${DP_OK} | TikTok : ${TT_OK} | Prime : ${PV_OK} | Max : ${MX_OK}"
   else
-    echo "未执行"
+    echo "  未执行"
   fi
   hr
 
-  echo -e "${BLUE}【总评】${NC}"
-  echo "综合评分：${total}/100（${overall}）"
-  if [[ "$total" -ge 85 ]]; then ok "这台 VPS 整体素质很强：适合做中转/落地/流媒体测试/轻量服务。"
-  elif [[ "$total" -ge 70 ]]; then ok "整体不错：日常中转/落地够用，建议关注路由与邻居波动。"
-  elif [[ "$total" -ge 55 ]]; then warn "整体一般：建议换机房/换商家或降低用途预期。"
-  else bad "整体偏弱：不建议做关键落地或高稳定需求用途。"
+  echo -e "${BLUE}【总评】${NC}  $(tag_by_grade "$overall")  ${total}/100（${overall}）"
+  if [[ "$total" -ge 85 ]]; then
+    ok "整体素质很强：适合做中转 / 落地 / 流媒体测试 / 轻量服务。"
+  elif [[ "$total" -ge 70 ]]; then
+    ok "整体不错：日常中转/落地够用，建议关注路由与邻居波动。"
+  elif [[ "$total" -ge 55 ]]; then
+    warn "整体一般：建议换机房/换商家或降低用途预期。"
+  else
+    bad "整体偏弱：不建议做关键落地或高稳定需求用途。"
   fi
 
   echo
-  info "公开贴结果前建议打码：IPv4、Host（如需要我可加 --redact 自动打码模式）。"
-  echo -e "${BLUE}===========================================================${NC}"
+  if [[ "$REDACT" -eq 1 ]]; then
+    info "已开启打码模式：Host/IPv4 已隐藏（--redact）。"
+  else
+    info "公开贴结果前建议打码：IPv4、Host（可用：./vps_check.sh --redact）。"
+  fi
+  echo -e "${BLUE}================================================================${NC}"
 }
 
 run_all() {
@@ -580,7 +649,7 @@ run_all() {
 menu() {
   while true; do
     echo -e "${BLUE}====================== VPS 一键体检 菜单 ======================${NC}"
-    echo "Targets: ${TARGETS[*]}"
+    echo "Targets: ${TARGETS[*]}  ${GRAY}(MTR 默认用第一个 Target)${NC}"
     echo
     echo "  1) 设置测试目标（Targets）"
     echo "  2) 基本信息（系统/CPU/RAM/磁盘占用/虚拟化）"
@@ -588,12 +657,13 @@ menu() {
     echo "  4) 网络 Ping 测试（所有 Targets）"
     echo "  5) 路由 MTR 测试（仅第一个 Target）"
     echo "  6) 安装 mtr-tiny（Debian/Ubuntu）"
-    echo "  7) 磁盘 dd 测速（修复版，输出速度）"
+    echo "  7) 磁盘 dd 测速（输出速度）"
     echo "  8) 流媒体检测（YouTube/动画疯/Netflix/Disney+/TikTok/Prime/Max）"
     echo "  9) 一键全跑（2~8）并输出最终总评"
+    echo "  R) 只输出“总结报告”（基于当前已跑过的结果）"
     echo "  0) 退出"
     hr
-    read -r -p "选择 [0-9]: " c || true
+    read -r -p "选择 [0-9/R]: " c || true
     echo
     case "${c:-}" in
       1) set_targets; pause ;;
