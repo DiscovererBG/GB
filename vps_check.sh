@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
 # =========================================================
-# VPS Health + Streaming Check (Read-only) - Menu Edition
-# - Menu: System / IP / Ping / MTR / Disk / Streaming / TCP(real)
-# - TCP: multi-source (TLS/TTFB/Mbps) + median scoring (fair)
-# - R: silent full-run (2~8+10) only final ✅ report (no spam)
-# - Output: beautified final report with colored progress bars
+# VPS Health + Streaming + TCP Real Check (Read-only) - Menu Edition
+# - 交互菜单：System / IP / Ping / MTR / Disk / Streaming / TCP
+# - 10：TCP 真实链路测试（TLS/TTFB/下载 Mbps，多源取中位数）
+# - 9 ：全跑（2~8+10）显示全过程
+# - R ：后台静默全跑（2~8+10），只输出最终✅总结（不刷屏）
+# - 修复：Ping min/mdev 解析；MTR 终点 Loss/Avg 解析；dd 速度解析；R 静默变量不丢
+# - 美化：彩色进度条 + 等级彩色（优秀/良好/一般/偏弱）
+# - 中文化：Ping 小结与总结报告关键字段
 #
 # Usage:
 #   bash <(curl -fsSL "https://raw.githubusercontent.com/DiscovererBG/GB/refs/heads/main/vps_check.sh")
-#   or:
-#   chmod +x vps_check.sh && ./vps_check.sh
+#   ./vps_check.sh
+#   ./vps_check.sh --redact
 #
 # NOTE:
-# - read-only checks; no system changes (except "install mtr" option)
+# - 只读检测，不改系统配置（除非你在菜单里选择“安装mtr”）
+# - 流媒体解锁 best-effort（最终以登录播放为准）
 # =========================================================
 
 set -euo pipefail
 
 # ---------- UI ----------
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; CYAN="\033[36m"; MAGENTA="\033[35m"; GRAY="\033[90m"; NC="\033[0m"
-BOLD="\033[1m"
-
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; MAGENTA="\033[35m"; CYAN="\033[36m"; GRAY="\033[90m"; NC="\033[0m"
 ok()   { echo -e "${GREEN}✅ $*${NC}"; }
 warn() { echo -e "${YELLOW}⚠️  $*${NC}"; }
 bad()  { echo -e "${RED}❌ $*${NC}"; }
@@ -28,29 +30,25 @@ info() { echo -e "${CYAN}ℹ️  $*${NC}"; }
 hr()   { echo -e "${MAGENTA}---------------------------------------------------------${NC}"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-pause() { read -r -p "回车继续..." _ || true; }
-
 # ---------- defaults ----------
 PING_COUNT=50
 PING_INTERVAL=0.2
 PING_INTERVAL_FALLBACK=0.5
 MTR_COUNT=100
 DISK_TEST_MB=256
-CURL_TIMEOUT=12
+CURL_TIMEOUT=10
+
 DEFAULT_TARGETS=("1.1.1.1" "8.8.8.8" "www.google.com")
+TARGETS=("${DEFAULT_TARGETS[@]}")
 
-# TCP test: multi-source
-TCP_RANGE_MB=16           # download range size (MB) - more stable than 8MB
-TCP_MAXTIME=12            # curl max time
-TCP_UA="Mozilla/5.0"
-
-# Known good endpoints (range-friendly, usually 206)
-# If any fails (404/000), we skip it and try next.
+# TCP 多源测试：更贴近代理体验（TLS/TTFB/下载）——多源取中位数更稳
+TCP_MAXTIME=12
+TCP_RANGE_MB=16
 TCP_SOURCES=(
-  "cloudflare|https://speed.cloudflare.com/__down?bytes=16777216"
-  "hetzner|https://speed.hetzner.de/100MB.bin"
-  "ovh|https://proof.ovh.net/files/100Mb.dat"
-  "cachefly|https://speedtest.tele2.net/100MB.zip"
+  "https://speed.cloudflare.com/__down?bytes=20000000|cloudflare"      # 约20MB（会自动 200）
+  "https://speed.hetzner.de/100MB.bin|hetzner"
+  "https://proof.ovh.net/files/100Mb.dat|ovh"
+  "https://cachefly.cachefly.net/100mb.test|cachefly"
 )
 
 # ---------- numeric helpers ----------
@@ -59,53 +57,42 @@ safe_num() { local x="${1:-}"; if is_number "$x"; then echo "$x"; else echo ""; 
 f_le() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a<=b)?0:1}'; }
 f_lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a<b)?0:1}'; }
 f_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit (a>=b)?0:1}'; }
-
-# median of list (space-separated)
-median() {
-  local nums=("$@")
-  local n="${#nums[@]}"
-  if [[ "$n" -eq 0 ]]; then echo ""; return 0; fi
-  # sort
-  local sorted
-  sorted="$(printf "%s\n" "${nums[@]}" | awk 'NF' | sort -n)"
-  local mid=$(( (n+1)/2 ))
-  # if even, average two middle (keep 1 decimal)
-  if (( n % 2 == 1 )); then
-    echo "$sorted" | awk -v m="$mid" 'NR==m{print $1; exit}'
-  else
-    local a b
-    a="$(echo "$sorted" | awk -v m="$mid" 'NR==m{print $1; exit}')"
-    b="$(echo "$sorted" | awk -v m="$((mid+1))" 'NR==m{print $1; exit}')"
-    awk -v a="$a" -v b="$b" 'BEGIN{printf "%.1f", (a+b)/2}'
-  fi
+median_of() { # stdin 数字 -> 输出中位数（若为空则空）
+  awk 'NF && $1+0==$1 {a[++n]=$1} END{
+    if(n==0){exit}
+    for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(a[i]>a[j]){t=a[i];a[i]=a[j];a[j]=t}
+    if(n%2==1)printf "%.2f", a[(n+1)/2];
+    else printf "%.2f", (a[n/2]+a[n/2+1])/2;
+  }'
 }
 
-# ---------- redact support ----------
+# ---------- args ----------
 REDACT=0
-for arg in "${@:-}"; do
-  [[ "$arg" == "--redact" ]] && REDACT=1
-done
-mask_ip() {
+if [[ "${1:-}" == "--redact" ]]; then REDACT=1; fi
+redact_ip() {
   local ip="$1"
-  # 139.180.220.197 -> 139.180.*.*
-  echo "$ip" | awk -F. 'NF==4{printf "%s.%s.*.*",$1,$2; exit} {print $0}'
+  if [[ "$REDACT" -eq 1 ]]; then
+    echo "$ip" | awk -F. 'NF==4{printf "%s.%s.*.*",$1,$2; next}{print}'
+  else
+    echo "$ip"
+  fi
 }
-mask_host() {
+redact_host() {
   local h="$1"
-  [[ -z "$h" || "$h" == "unknown" ]] && { echo "$h"; return; }
-  # vultr -> v***r
-  local len="${#h}"
-  if (( len <= 2 )); then echo "***"; else
-    echo "${h:0:1}***${h: -1}"
+  if [[ "$REDACT" -eq 1 ]]; then
+    echo "$h" | sed 's/./*/g'
+  else
+    echo "$h"
   fi
 }
 
-# ---------- global state ----------
+# ---------- global state for summary ----------
 RUN_SYS=0 RUN_IP=0 RUN_PING=0 RUN_MTR=0 RUN_DISK=0 RUN_STREAM=0 RUN_TCP=0
 
-HOSTNAME_=""; OS_=""; KERNEL_=""; UPTIME_=""; CPU_=""; CORES_=""; RAM_=""; SWAP_=""; LOAD_=""; VIRT_=""; DISKROOT_=""
+HOSTNAME_="unknown"; OS_="unknown"; KERNEL_="unknown"; UPTIME_="unknown"
+CPU_="unknown"; CORES_="1"; RAM_="0 MB"; SWAP_="0 MB"; LOAD_="unknown"; VIRT_="unknown"; DISKROOT_="unknown"
+
 IPV4_="unknown"; GEO_="unknown"; ASN_="unknown"; ORG_="unknown"
-TARGETS=("${DEFAULT_TARGETS[@]}")
 
 # ping summary
 PING_TOTAL_TARGETS=0
@@ -139,12 +126,13 @@ MX_OK="unknown"
 TCP_TLS_MS=""
 TCP_TTFB_MS=""
 TCP_DL_MBPS=""
-TCP_HTTP_CODE=""
-TCP_SOURCE_USED=""
+TCP_DL_SRC=""
+TCP_CODE=""
 TCP_RATING="unknown"
-TCP_SCORE=0
 
-# ---------- colored grade helpers ----------
+pause() { read -r -p "回车继续..." _ || true; }
+
+# ---------- grade helpers (color + text) ----------
 grade_text() {
   local x="$1"
   if [[ "$x" -ge 85 ]]; then echo "优秀"
@@ -154,37 +142,41 @@ grade_text() {
   fi
 }
 grade_color() {
-  local x="$1"
-  if [[ "$x" -ge 85 ]]; then echo "$GREEN"
-  elif [[ "$x" -ge 70 ]]; then echo "$CYAN"
-  elif [[ "$x" -ge 55 ]]; then echo "$YELLOW"
-  else echo "$RED"
-  fi
+  local g="$1"
+  case "$g" in
+    优秀) echo "$GREEN" ;;
+    良好) echo "$CYAN" ;;
+    一般) echo "$YELLOW" ;;
+    偏弱) echo "$RED" ;;
+    *) echo "$NC" ;;
+  esac
 }
-grade_icon() {
-  local x="$1"
-  if [[ "$x" -ge 70 ]]; then echo "✅"
-  elif [[ "$x" -ge 55 ]]; then echo "⚠️"
-  else echo "❌"
-  fi
+badge() { # score -> 彩色 "(优秀)" 这类输出
+  local x="$1" g c
+  g="$(grade_text "$x")"
+  c="$(grade_color "$g")"
+  echo -e "${c}(${g})${NC}"
 }
-
-# progress bar with color by score
 bar() {
   local score="$1" width="${2:-28}"
   [[ -z "${score:-}" ]] && score=0
-  local filled=$(( score*width/100 ))
-  local empty=$(( width-filled ))
-  local c
-  c="$(grade_color "$score")"
-  printf "%b[%s%s]%b" \
-    "$c" \
-    "$(printf '%0.s█' $(seq 1 "$filled" 2>/dev/null || true))" \
-    "$(printf '%0.s░' $(seq 1 "$empty" 2>/dev/null || true))" \
-    "$NC"
+  if ! is_number "$score"; then score=0; fi
+  score="$(awk -v x="$score" 'BEGIN{if(x<0)x=0; if(x>100)x=100; printf "%.0f", x}')"
+  local filled=$(( score * width / 100 ))
+  local empty=$(( width - filled ))
+
+  local g c
+  g="$(grade_text "$score")"
+  c="$(grade_color "$g")"
+
+  local solid hollow
+  solid="$(printf "%*s" "$filled" "" | tr ' ' '█')"
+  hollow="$(printf "%*s" "$empty" "" | tr ' ' '░')"
+
+  echo -e "[${c}${solid}${NC}${GRAY}${hollow}${NC}]"
 }
 
-# ---------- Targets ----------
+# ---------- targets ----------
 set_targets() {
   echo
   read -r -p "输入你要测试的目标（空格分隔，留空=默认 1.1.1.1 8.8.8.8 www.google.com）: " input || true
@@ -197,7 +189,7 @@ set_targets() {
   echo
 }
 
-# ---------- System ----------
+# ---------- system ----------
 gather_system() {
   RUN_SYS=1
   HOSTNAME_="$(hostname 2>/dev/null || echo unknown)"
@@ -214,7 +206,7 @@ gather_system() {
   DISKROOT_="$(df -hP / 2>/dev/null | tail -n 1 | awk '{print $3"/"$2" ("$5")"}' || echo unknown)"
 
   echo -e "${MAGENTA}--- 基本信息 ---${NC}"
-  echo "Host      : ${HOSTNAME_}"
+  echo "Host      : $(redact_host "${HOSTNAME_}")"
   echo "OS        : ${OS_}"
   echo "Kernel    : ${KERNEL_}"
   echo "Uptime    : ${UPTIME_}"
@@ -226,7 +218,7 @@ gather_system() {
   hr
 }
 
-# ---------- IP ----------
+# ---------- ip ----------
 gather_ip() {
   RUN_IP=1
   IPV4_="unknown"; GEO_="unknown"; ASN_="unknown"; ORG_="unknown"
@@ -243,44 +235,51 @@ gather_ip() {
     ASN_="$(echo "$json" | sed -n 's/.*"as":"\([^"]*\)".*/\1/p')"
     ORG_="$(echo "$json" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
   fi
-
   echo -e "${MAGENTA}--- 公网信息 ---${NC}"
-  echo "IPv4      : ${IPV4_}"
+  echo "IPv4      : $(redact_ip "${IPV4_}")"
   echo "Geo       : ${GEO_}"
   echo "ASN       : ${ASN_}"
   echo "ISP/Org   : ${ORG_}"
   hr
 }
 
-# ---------- Ping ----------
+# ---------- ping ----------
 ping_once() {
   local target="$1" interval="$2"
   ping -c "${PING_COUNT}" -i "${interval}" -n "$target" 2>/dev/null
 }
-
+parse_ping_rtt_line() {
+  local out="$1"
+  echo "$out" | awk '
+    /rtt min\/avg\/max\/mdev/ {print; exit}
+    /round-trip min\/avg\/max\/(mdev|stddev)/ {print; exit}
+  '
+}
 ping_test_one() {
   local target="$1"
-  echo -e "${MAGENTA}--- Ping: ${target} (${PING_COUNT} packets) ---${NC}"
+  echo -e "${MAGENTA}--- Ping：${target} (${PING_COUNT} packets) ---${NC}"
 
   if ! need_cmd ping; then
     warn "没有 ping 命令，跳过。"
     return 0
   fi
 
-  local out loss avg min max mdev
+  local out loss min avg max mdev rttline
   if ! out="$(ping_once "$target" "$PING_INTERVAL")"; then
     warn "ping 间隔 ${PING_INTERVAL}s 失败，降级到 ${PING_INTERVAL_FALLBACK}s..."
     out="$(ping_once "$target" "$PING_INTERVAL_FALLBACK" || true)"
   fi
 
   loss="$(echo "$out" | awk -F', ' '/packet loss/{print $3}' | awk '{print $1}' | tr -d '%')"
-  avg="$(echo "$out" | awk -F'=' '/rtt|round-trip/{print $2}' | awk -F'/' '{print $2}')"
-  min="$(echo "$out" | awk -F'=' '/rtt|round-trip/{print $2}' | awk -F'/' '{print $1}')"
-  max="$(echo "$out" | awk -F'=' '/rtt|round-trip/{print $2}' | awk -F'/' '{print $3}')"
-  mdev="$(echo "$out" | awk -F'=' '/rtt|round-trip/{print $2}' | awk -F'/' '{print $4}' )"
-
   loss="$(safe_num "$loss")"
-  avg="$(safe_num "$avg")"; min="$(safe_num "$min")"; max="$(safe_num "$max")"; mdev="$(safe_num "$mdev")"
+
+  rttline="$(parse_ping_rtt_line "$out" || true)"
+  min="$(echo "$rttline" | sed -n 's/.*= *\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\).*/\1/p')"
+  avg="$(echo "$rttline" | sed -n 's/.*= *\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\).*/\2/p')"
+  max="$(echo "$rttline" | sed -n 's/.*= *\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\).*/\3/p')"
+  mdev="$(echo "$rttline" | sed -n 's/.*= *\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\)\/\([0-9.]\+\).*/\4/p')"
+
+  min="$(safe_num "$min")"; avg="$(safe_num "$avg")"; max="$(safe_num "$max")"; mdev="$(safe_num "$mdev")"
 
   echo "Loss      : ${loss:-?}%"
   echo "RTT ms    : min=${min:-?} avg=${avg:-?} max=${max:-?} mdev=${mdev:-?}"
@@ -293,7 +292,7 @@ ping_test_one() {
 
   if [[ "$rating" == "GOOD" ]]; then ok "丢包：优秀（<=1%）"; ((PING_GOOD++)) || true
   elif [[ "$rating" == "WARN" ]]; then warn "丢包：一般（1%~5%）"; ((PING_WARN++)) || true
-  else bad "丢包：偏高（>5%）"; ((PING_BAD++)) || true
+  else bad "丢包：偏弱（>5%）"; ((PING_BAD++)) || true
   fi
 
   if [[ -n "${avg:-}" ]]; then
@@ -303,6 +302,7 @@ ping_test_one() {
     fi
   fi
 
+  # track worst
   if [[ -n "${loss:-}" ]]; then
     if [[ -z "${PING_WORST_LOSS:-}" ]]; then PING_WORST_LOSS="$loss"; else
       awk -v a="$loss" -v b="$PING_WORST_LOSS" 'BEGIN{exit (a>b)?0:1}' && PING_WORST_LOSS="$loss" || true
@@ -316,7 +316,6 @@ ping_test_one() {
 
   echo
 }
-
 run_ping_all() {
   RUN_PING=1
   PING_TOTAL_TARGETS="${#TARGETS[@]}"
@@ -324,11 +323,11 @@ run_ping_all() {
   PING_WORST_LOSS=""; PING_WORST_AVG=""
   for t in "${TARGETS[@]}"; do ping_test_one "$t"; done
   hr
-  info "Ping 小结: Targets=${PING_TOTAL_TARGETS} | GOOD=${PING_GOOD} WARN=${PING_WARN} BAD=${PING_BAD} | worstLoss=${PING_WORST_LOSS:-?}% worstAvg=${PING_WORST_AVG:-?}ms"
+  info "Ping 小结：目标数=${PING_TOTAL_TARGETS} | 优秀=${PING_GOOD} 一般=${PING_WARN} 偏弱=${PING_BAD} | 最差丢包=${PING_WORST_LOSS:-?}% 最差平均延迟=${PING_WORST_AVG:-?}ms"
   hr
 }
 
-# ---------- MTR ----------
+# ---------- mtr ----------
 install_mtr() {
   if ! need_cmd apt; then
     warn "系统没有 apt（非 Debian/Ubuntu）或未找到 apt，跳过安装。"
@@ -338,11 +337,10 @@ install_mtr() {
   apt update && apt install -y mtr-tiny
   ok "mtr 安装完成。"
 }
-
 run_mtr() {
   RUN_MTR=1
   local target="${TARGETS[0]}"
-  echo -e "${MAGENTA}--- MTR: ${target} (${MTR_COUNT} cycles) ---${NC}"
+  echo -e "${MAGENTA}--- MTR：${target} (${MTR_COUNT} cycles) ---${NC}"
   if ! need_cmd mtr; then
     warn "未安装 mtr。（可在菜单选择安装 mtr-tiny）"
     MTR_LASTLOSS=""; MTR_LASTAVG=""; MTR_RATING="unknown"
@@ -354,18 +352,12 @@ run_mtr() {
   out="$(mtr -rwzbc "${MTR_COUNT}" "$target" 2>/dev/null || true)"
   echo "$out" | head -n 3
   echo -e "${GRAY}...（中间省略）...${NC}"
-  echo "$out" | tail -n 8
+  echo "$out" | tail -n 7
 
-  # last hop line: most reliable is matching target at end
-  last_line="$(echo "$out" | awk -v t="$target" '$0 ~ t {line=$0} END{print line}')"
-  if [[ -z "${last_line:-}" ]]; then last_line="$(echo "$out" | tail -n 1)"; fi
-
-  # mtr columns: Loss% Snt Last Avg Best Wrst StDev
+  last_line="$(echo "$out" | tail -n 1)"
   last_loss="$(echo "$last_line" | awk '{print $3}' | tr -d '%')"
   last_avg="$(echo "$last_line" | awk '{print $6}')"
-
-  last_loss="$(safe_num "$last_loss")"
-  last_avg="$(safe_num "$last_avg")"
+  last_loss="$(safe_num "$last_loss")"; last_avg="$(safe_num "$last_avg")"
 
   MTR_LASTLOSS="${last_loss:-}"
   MTR_LASTAVG="${last_avg:-}"
@@ -377,7 +369,7 @@ run_mtr() {
   if [[ -n "${last_loss:-}" ]]; then
     if f_le "$last_loss" "1.0"; then ok "路由质量：优秀"; MTR_RATING="GOOD"
     elif f_le "$last_loss" "5.0"; then warn "路由质量：一般"; MTR_RATING="WARN"
-    else bad "路由质量：偏差"; MTR_RATING="BAD"
+    else bad "路由质量：偏弱"; MTR_RATING="BAD"
     fi
   else
     MTR_RATING="unknown"
@@ -385,7 +377,7 @@ run_mtr() {
   hr
 }
 
-# ---------- Disk ----------
+# ---------- disk dd ----------
 run_disk() {
   RUN_DISK=1
   echo -e "${MAGENTA}--- 磁盘快速测试（dd 写入 ${DISK_TEST_MB}MB 到 /tmp）---${NC}"
@@ -408,9 +400,8 @@ run_disk() {
   mbps="$(echo "$DISK_SPEED_RAW" | awk '{print $1}' 2>/dev/null || true)"
   unit="$(echo "$DISK_SPEED_RAW" | awk '{print $2}' 2>/dev/null || true)"
   mbps="$(safe_num "$mbps")"
-
   if [[ -n "${mbps:-}" && -n "${unit:-}" ]]; then
-    if [[ "$unit" == "GB/s" ]]; then
+    if [[ "$unit" == "GB/s" || "$unit" == "GB/s," ]]; then
       mbps="$(awk -v x="$mbps" 'BEGIN{printf "%.2f", x*1024}')"
     fi
     DISK_MBPS="$mbps"
@@ -425,10 +416,10 @@ run_disk() {
   hr
 }
 
-# ---------- Streaming ----------
-fetch()   { curl -L -s --max-time "${CURL_TIMEOUT}" -A "${TCP_UA}" "$1" 2>/dev/null || true; }
-head_req(){ curl -I -s --max-time "${CURL_TIMEOUT}" -A "${TCP_UA}" "$1" 2>/dev/null || true; }
-code_of() { curl -L -s -o /dev/null --max-time "${CURL_TIMEOUT}" -w "%{http_code}" -A "${TCP_UA}" "$1" 2>/dev/null || true; }
+# ---------- streaming ----------
+fetch()   { curl -L -s --max-time "${CURL_TIMEOUT}" -A "Mozilla/5.0" "$1" 2>/dev/null || true; }
+head_req(){ curl -I -s --max-time "${CURL_TIMEOUT}" -A "Mozilla/5.0" "$1" 2>/dev/null || true; }
+code_of() { curl -L -s -o /dev/null --max-time "${CURL_TIMEOUT}" -w "%{http_code}" -A "Mozilla/5.0" "$1" 2>/dev/null || true; }
 
 run_streaming() {
   RUN_STREAM=1
@@ -439,6 +430,7 @@ run_streaming() {
 
   echo -e "${MAGENTA}--- 流媒体解锁检测（best-effort）---${NC}"
 
+  # YouTube
   local yt_code yt_html yt_cc
   yt_code="$(code_of "https://www.youtube.com/premium")"
   yt_html="$(fetch "https://www.youtube.com/premium")"
@@ -450,6 +442,7 @@ run_streaming() {
   fi
   echo
 
+  # AniGamer
   local ag_code ag_html
   ag_code="$(code_of "https://ani.gamer.com.tw/")"
   ag_html="$(fetch "https://ani.gamer.com.tw/")"
@@ -469,13 +462,12 @@ run_streaming() {
   fi
   echo
 
-  local nf_code nf_head nf_redirect
+  # Netflix
+  local nf_code
   nf_code="$(code_of "https://www.netflix.com/title/80018499")"
-  nf_head="$(head_req "https://www.netflix.com/title/80018499")"
-  nf_redirect="$(echo "$nf_head" | awk '/^location:/I{print $2}' | tr -d '\r' | head -n1)"
   echo "Netflix HTTP         : ${nf_code}"
   if [[ "$nf_code" == "200" || "$nf_code" == "302" ]]; then
-    [[ -n "${nf_redirect:-}" ]] && ok "Netflix：可访问（有重定向，属正常地区跳转可能）" || ok "Netflix：可访问（需登录/播放验证片库）"
+    ok "Netflix：可访问（需登录/播放验证片库）"
     NF_OK="OK"
   else
     warn "Netflix：可能不可访问/被阻断（HTTP ${nf_code}）"
@@ -483,13 +475,12 @@ run_streaming() {
   fi
   echo
 
-  local dp_code dp_head dp_loc
+  # Disney+
+  local dp_code
   dp_code="$(code_of "https://www.disneyplus.com/")"
-  dp_head="$(head_req "https://www.disneyplus.com/")"
-  dp_loc="$(echo "$dp_head" | awk '/^location:/I{print $2}' | tr -d '\r' | head -n1)"
   echo "Disney+ HTTP         : ${dp_code}"
   if [[ "$dp_code" == "200" || "$dp_code" == "301" || "$dp_code" == "302" ]]; then
-    echo "$dp_loc" | grep -qi "disneyplus.com/" && ok "Disney+：可访问（地区跳转属正常）" || ok "Disney+：可访问"
+    ok "Disney+：可访问（是否可播放仍看地区与账号）"
     DP_OK="OK"
   else
     warn "Disney+：可能不可访问/地区限制（HTTP ${dp_code}）"
@@ -497,14 +488,12 @@ run_streaming() {
   fi
   echo
 
-  local tt_code tt_head tt_region tt_cf
+  # TikTok
+  local tt_code
   tt_code="$(code_of "https://www.tiktok.com/")"
-  tt_head="$(head_req "https://www.tiktok.com/")"
-  tt_region="$(echo "$tt_head" | awk -F': ' 'tolower($1)=="x-tt-region"{print $2}' | tr -d '\r' | head -n1)"
-  tt_cf="$(echo "$tt_head" | awk -F': ' 'tolower($1)=="cf-ray"{print $2}' | tr -d '\r' | head -n1)"
-  echo "TikTok HTTP          : ${tt_code}  x-tt-region: ${tt_region:-unknown}"
+  echo "TikTok HTTP          : ${tt_code}"
   if [[ "$tt_code" == "200" || "$tt_code" == "302" ]]; then
-    [[ -n "${tt_region:-}" ]] && ok "TikTok：可访问（推测地区 ${tt_region}）" || warn "TikTok：可访问，但无法判断地区（可能 CF/风控隐藏，cf-ray=${tt_cf:-n/a}）"
+    ok "TikTok：可访问（可能仍受风控影响）"
     TT_OK="OK"
   elif [[ "$tt_code" == "403" ]]; then
     bad "TikTok：403（常见于地区限制/风控/CF 拦截）"
@@ -515,6 +504,7 @@ run_streaming() {
   fi
   echo
 
+  # Prime Video
   local pv_code
   pv_code="$(code_of "https://www.primevideo.com/")"
   echo "PrimeVideo HTTP      : ${pv_code}"
@@ -527,9 +517,10 @@ run_streaming() {
   fi
   echo
 
+  # Max
   local mx_code
   mx_code="$(code_of "https://play.max.com/")"
-  echo "Max(HBO) HTTP         : ${mx_code}"
+  echo "Max(HBO) HTTP        : ${mx_code}"
   if [[ "$mx_code" == "200" || "$mx_code" == "301" || "$mx_code" == "302" ]]; then
     ok "Max：可访问（是否可播放仍看地区与账号）"
     MX_OK="OK"
@@ -537,203 +528,165 @@ run_streaming() {
     warn "Max：可能不可访问/地区限制（HTTP ${mx_code}）"
     MX_OK="WARN"
   fi
+  echo
 
   hr
   info "提示：Netflix/Disney+/Max/Prime 仅能判断“可访问/疑似限制”，最终以登录播放为准。"
-  info "TikTok 易受 Cloudflare/风控影响，建议多测几次综合判断。"
+  info "TikTok 易受风控/CF 影响，建议多测几次综合判断。"
   hr
 }
 
-# ---------- TCP Real Test (multi-source + median) ----------
-curl_time_ms() {
-  # returns ms integer (best-effort)
-  local s="$1"
-  [[ -z "$s" ]] && { echo ""; return 0; }
-  awk -v x="$s" 'BEGIN{ if(x+0==x) printf "%.0f", x*1000; }'
-}
+# ---------- TCP real link test ----------
+tcp_probe_one() {
+  local url="$1" label="$2"
 
-tcp_test_one_source() {
-  local name="$1" url="$2"
-  # Use range to limit download, keep fair and quick
-  local range_bytes=$(( TCP_RANGE_MB*1024*1024 - 1 ))
-
-  # curl output: tls(ms) ttfb(ms) total(s) size(bytes) speed(B/s) code
-  # time_appconnect for TLS handshake (HTTPS); if HTTP, it may be 0
-  local fmt="tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} size=%{size_download} speed=%{speed_download} code=%{http_code}\n"
+  # 只拉一段 range，避免大流量
+  # -w 输出：code,tls,ttfb,speed
+  # tls: time_appconnect (TLS握手完成)
+  # ttfb: time_starttransfer (首字节)
+  # speed: speed_download (bytes/sec) —— 用 range 的小段测“瞬时吞吐”
   local out
-  out="$(curl -L -s -o /dev/null --max-time "$TCP_MAXTIME" -A "$TCP_UA" \
-        -r "0-${range_bytes}" -w "$fmt" "$url" 2>/dev/null || true)"
+  out="$(curl -L -s -o /dev/null \
+    -A "Mozilla/5.0" \
+    --max-time "${TCP_MAXTIME}" \
+    -r "0-$((TCP_RANGE_MB*1024*1024-1))" \
+    -w "%{http_code}|%{time_appconnect}|%{time_starttransfer}|%{speed_download}\n" \
+    "$url" 2>/dev/null || true)"
 
-  local tls_s ttfb_s total_s size speed code
-  tls_s="$(echo "$out"  | awk -F'tls=' '{print $2}' | awk '{print $1}' | tr -d '\r')"
-  ttfb_s="$(echo "$out" | awk -F'ttfb=' '{print $2}' | awk '{print $1}' | tr -d '\r')"
-  total_s="$(echo "$out"| awk -F'total=' '{print $2}'| awk '{print $1}' | tr -d '\r')"
-  size="$(echo "$out"   | awk -F'size=' '{print $2}' | awk '{print $1}' | tr -d '\r')"
-  speed="$(echo "$out"  | awk -F'speed=' '{print $2}'| awk '{print $1}' | tr -d '\r')"
-  code="$(echo "$out"   | awk -F'code=' '{print $2}' | awk '{print $1}' | tr -d '\r')"
+  local code tls ttfb spd_bps
+  code="$(echo "$out" | awk -F'|' '{print $1}')"
+  tls="$(echo "$out" | awk -F'|' '{print $2}')"
+  ttfb="$(echo "$out" | awk -F'|' '{print $3}')"
+  spd_bps="$(echo "$out" | awk -F'|' '{print $4}')"
 
-  tls_s="$(safe_num "$tls_s")"
-  ttfb_s="$(safe_num "$ttfb_s")"
-  total_s="$(safe_num "$total_s")"
-  size="$(safe_num "$size")"
-  speed="$(safe_num "$speed")"
+  # code=000 表示没拿到 HTTP 响应（超时/被阻断/DNS等）
+  if [[ -z "${code:-}" ]]; then code="000"; fi
 
+  # 统一转 ms
   local tls_ms ttfb_ms mbps
-  tls_ms="$(curl_time_ms "$tls_s")"
-  ttfb_ms="$(curl_time_ms "$ttfb_s")"
-  # Mbps = (speed B/s) * 8 / 1e6
-  if [[ -n "${speed:-}" ]]; then
-    mbps="$(awk -v bps="$speed" 'BEGIN{printf "%.2f", (bps*8)/1000000 }')"
-  else
-    mbps=""
+  tls_ms=""
+  ttfb_ms=""
+  mbps=""
+
+  tls="$(safe_num "$tls")"
+  ttfb="$(safe_num "$ttfb")"
+  spd_bps="$(safe_num "$spd_bps")"
+
+  if [[ -n "${tls:-}" ]]; then tls_ms="$(awk -v x="$tls" 'BEGIN{printf "%.0f", x*1000}')" ; fi
+  if [[ -n "${ttfb:-}" ]]; then ttfb_ms="$(awk -v x="$ttfb" 'BEGIN{printf "%.0f", x*1000}')" ; fi
+  if [[ -n "${spd_bps:-}" ]]; then
+    # bytes/sec -> Mbps
+    mbps="$(awk -v x="$spd_bps" 'BEGIN{printf "%.2f", x*8/1000000}')"
   fi
 
-  # validity: code 200/206/302/301 acceptable; but range usually returns 206
-  local valid=0
-  if [[ "$code" == "200" || "$code" == "206" || "$code" == "301" || "$code" == "302" ]]; then
-    valid=1
-  fi
-
-  echo "${name}|${valid}|${tls_ms:-0}|${ttfb_ms:-0}|${mbps:-}|${code:-000}"
+  echo "${label}|${code}|${tls_ms:-}|${ttfb_ms:-}|${mbps:-}"
 }
 
-score_tcp_from_median() {
-  # median tls, ttfb, mbps -> score 0..100
-  local tls_ms="$1" ttfb_ms="$2" mbps="$3"
-  tls_ms="$(safe_num "$tls_ms")"
-  ttfb_ms="$(safe_num "$ttfb_ms")"
-  mbps="$(safe_num "$mbps")"
-
-  # base from speed
-  local s_speed=0 s_tls=0 s_ttfb=0 score=0
-
-  # speed scoring (most important)
-  if [[ -n "${mbps:-}" ]]; then
-    if f_ge "$mbps" "80"; then s_speed=60
-    elif f_ge "$mbps" "30"; then s_speed=50
-    elif f_ge "$mbps" "10"; then s_speed=40
-    elif f_ge "$mbps" "3";  then s_speed=28
-    else s_speed=18
-    fi
-  else
-    s_speed=0
-  fi
-
-  # TLS handshake scoring
-  if [[ -n "${tls_ms:-}" ]]; then
-    if f_lt "$tls_ms" "120"; then s_tls=20
-    elif f_lt "$tls_ms" "250"; then s_tls=15
-    elif f_lt "$tls_ms" "600"; then s_tls=10
-    else s_tls=5
-    fi
-  fi
-
-  # TTFB scoring
-  if [[ -n "${ttfb_ms:-}" ]]; then
-    if f_lt "$ttfb_ms" "200"; then s_ttfb=20
-    elif f_lt "$ttfb_ms" "450"; then s_ttfb=15
-    elif f_lt "$ttfb_ms" "900"; then s_ttfb=10
-    else s_ttfb=5
-    fi
-  fi
-
-  score=$(( s_speed + s_tls + s_ttfb ))
-  [[ "$score" -gt 100 ]] && score=100
-  echo "$score"
-}
-
-run_tcp_real() {
+run_tcp() {
   RUN_TCP=1
   if ! need_cmd curl; then
-    bad "缺少 curl，无法做 TCP 测试。"
-    TCP_RATING="unknown"; TCP_SCORE=0
-    hr
+    bad "缺少 curl，无法做 TCP 真实链路测试。"
+    TCP_TLS_MS=""; TCP_TTFB_MS=""; TCP_DL_MBPS=""; TCP_DL_SRC=""; TCP_CODE=""; TCP_RATING="unknown"
     return 0
   fi
 
   echo -e "${MAGENTA}--- TCP 真实链路测试（更贴近代理体验，多源取中位数）---${NC}"
-  info "范围: ${TCP_RANGE_MB}MB | maxtime=${TCP_MAXTIME}s | sources=cloudflare/hetzner/ovh/cachefly（能测几个算几个）"
+  info "范围：${TCP_RANGE_MB}MB | maxTime=${TCP_MAXTIME}s | sources=$(echo "${TCP_SOURCES[*]}" | awk -F'|' '{printf "%s/", $2}' | sed 's/\/$//')（能测几个算几个）"
 
-  local results=()
-  local tls_list=() ttfb_list=() mbps_list=()
-  local best_source="" best_mbps=""
+  local tmp
+  tmp="$(mktemp)"
+  : > "$tmp"
 
-  for item in "${TCP_SOURCES[@]}"; do
-    local name url
-    name="${item%%|*}"
-    url="${item#*|}"
-
-    local line
-    line="$(tcp_test_one_source "$name" "$url")"
-    results+=("$line")
-
-    local valid tls_ms ttfb_ms mbps code
-    valid="$(echo "$line" | awk -F'|' '{print $2}')"
+  local best_mbps=0 best_src="unknown"
+  for s in "${TCP_SOURCES[@]}"; do
+    local url label line src code tls_ms ttfb_ms mbps
+    url="${s%%|*}"
+    label="${s##*|}"
+    line="$(tcp_probe_one "$url" "$label")"
+    src="$(echo "$line" | awk -F'|' '{print $1}')"
+    code="$(echo "$line" | awk -F'|' '{print $2}')"
     tls_ms="$(echo "$line" | awk -F'|' '{print $3}')"
     ttfb_ms="$(echo "$line" | awk -F'|' '{print $4}')"
     mbps="$(echo "$line" | awk -F'|' '{print $5}')"
-    code="$(echo "$line" | awk -F'|' '{print $6}')"
 
-    if [[ "$valid" == "1" && -n "${mbps:-}" ]]; then
-      tls_list+=("$tls_ms")
-      ttfb_list+=("$ttfb_ms")
-      mbps_list+=("$mbps")
-      if [[ -z "${best_mbps:-}" ]]; then best_mbps="$mbps"; best_source="$name"; else
-        awk -v a="$mbps" -v b="$best_mbps" 'BEGIN{exit (a>b)?0:1}' && { best_mbps="$mbps"; best_source="$name"; } || true
-      fi
+    if [[ "$code" == "000" || -z "${mbps:-}" ]]; then
+      echo -e "  • ${YELLOW}${src}${NC}: DL=?Mbps  code=${code}（跳过）"
+      continue
     fi
 
-    # print each source line (compact)
-    if [[ "$valid" == "1" ]]; then
-      echo -e "  ${GREEN}•${NC} ${name}: TLS=${tls_ms}ms  TTFB=${ttfb_ms}ms  DL=${mbps:-?}Mbps  code=${code}"
-    else
-      echo -e "  ${YELLOW}•${NC} ${name}: DL=?Mbps  code=${code}（跳过）"
-    fi
+    echo -e "  • ${GREEN}${src}${NC}: TLS=${tls_ms:-?}ms  TTFB=${ttfb_ms:-?}ms  DL=${mbps}Mbps  code=${code}"
+    echo "$tls_ms $ttfb_ms $mbps $src $code" >> "$tmp"
+
+    # best
+    awk -v a="$mbps" -v b="$best_mbps" 'BEGIN{exit (a>b)?0:1}' && { best_mbps="$mbps"; best_src="$src"; } || true
   done
 
+  # 取中位数（只对成功项）
+  local tls_med ttfb_med dl_med
+  tls_med="$(awk '{print $1}' "$tmp" | median_of || true)"
+  ttfb_med="$(awk '{print $2}' "$tmp" | median_of || true)"
+  dl_med="$(awk '{print $3}' "$tmp" | median_of || true)"
+
+  rm -f "$tmp" >/dev/null 2>&1 || true
+
+  TCP_TLS_MS="${tls_med:-}"
+  TCP_TTFB_MS="${ttfb_med:-}"
+  TCP_DL_MBPS="${dl_med:-}"
+  TCP_DL_SRC="median"
+  TCP_CODE="median"
+
   echo
-
-  local mtls mttfb mmbps
-  mtls="$(median "${tls_list[@]}")"
-  mttfb="$(median "${ttfb_list[@]}")"
-  mmbps="$(median "${mbps_list[@]}")"
-
-  TCP_TLS_MS="${mtls:-}"
-  TCP_TTFB_MS="${mttfb:-}"
-  TCP_DL_MBPS="${mmbps:-}"
-  TCP_SOURCE_USED="median"
-
-  if [[ -z "${mmbps:-}" ]]; then
-    TCP_SCORE=0
+  if [[ -n "${dl_med:-}" ]]; then
+    echo -e "${GRAY}Median:${NC} TLS=${tls_med:-?}ms | TTFB=${ttfb_med:-?}ms | DL=${dl_med}Mbps  (best=${best_src} ${best_mbps}Mbps)"
+  else
+    warn "TCP：没有可用结果（所有源都失败/超时/被拦截）"
     TCP_RATING="unknown"
-    warn "TCP：没有拿到有效下载结果（可能被墙/被风控/源不可达）。"
     hr
     return 0
   fi
 
-  TCP_SCORE="$(score_tcp_from_median "$mtls" "$mttfb" "$mmbps")"
-
-  if [[ "$TCP_SCORE" -ge 85 ]]; then
+  # 评分逻辑（更贴近代理体验）：DL 权重更大，TTFB 次之，TLS 再次
+  # 简单分档：
+  # - 优秀：DL>=200 且 TTFB<=300
+  # - 良好：DL>=50  且 TTFB<=800
+  # - 一般：DL>=10
+  # - 偏弱：DL<10
+  local dl="$dl_med" ttfb="$ttfb_med"
+  TCP_RATING="WARN"
+  if f_ge "$dl" "200" && [[ -n "${ttfb:-}" ]] && f_le "$ttfb" "300"; then
     TCP_RATING="GOOD"
     ok "TCP 体验：优秀（median）"
-  elif [[ "$TCP_SCORE" -ge 70 ]]; then
+  elif f_ge "$dl" "50" && [[ -n "${ttfb:-}" ]] && f_le "$ttfb" "800"; then
+    TCP_RATING="OK"
+    echo -e "${CYAN}⚠️  TCP 体验：良好（median）${NC}"
+  elif f_ge "$dl" "10"; then
     TCP_RATING="WARN"
-    warn "TCP 体验：良好（median）"
-  elif [[ "$TCP_SCORE" -ge 55 ]]; then
-    TCP_RATING="WARN"
-    warn "TCP 体验：一般（median）"
+    echo -e "${YELLOW}⚠️  TCP 体验：一般（median）${NC}"
   else
     TCP_RATING="BAD"
-    bad "TCP 体验：偏弱（median）"
+    echo -e "${RED}❌ TCP 体验：偏弱（median）${NC}"
   fi
-
-  echo -e "${GRAY}Median: TLS=${mtls:-?}ms | TTFB=${mttfb:-?}ms | DL=${mmbps:-?}Mbps  （best=${best_source:-?} ${best_mbps:-?}Mbps）${NC}"
   hr
 }
 
-# ---------- scoring + report ----------
-calc_net_score() {
-  local net_score=0
+# ---------- scoring + summary ----------
+score_from_grade() {
+  local g="$1"
+  case "$g" in
+    GOOD) echo 95 ;;
+    OK)   echo 80 ;;
+    WARN) echo 65 ;;
+    BAD)  echo 40 ;;
+    *)    echo 0 ;;
+  esac
+}
+
+overall_summary() {
+  # network score
+  local net_score=0 disk_score=0 stream_score=0 tcp_score=0 total=0 used=0
+  local net_g disk_g stream_g tcp_g overall_g
+  local net_c disk_c stream_c tcp_c overall_c
+
   if [[ "$RUN_PING" -eq 1 ]]; then
     local denom="$PING_TOTAL_TARGETS"
     [[ "$denom" -lt 1 ]] && denom=1
@@ -744,14 +697,11 @@ calc_net_score() {
 
   if [[ "$RUN_MTR" -eq 1 ]]; then
     if [[ "$MTR_RATING" == "GOOD" ]]; then net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x+10}')" ; fi
-    if [[ "$MTR_RATING" == "BAD"  ]]; then net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x-10}')" ; fi
+    if [[ "$MTR_RATING" == "BAD" ]]; then  net_score="$(awk -v x="$net_score" 'BEGIN{printf "%.0f", x-10}')" ; fi
   fi
   net_score="$(awk -v x="$net_score" 'BEGIN{if(x<0)x=0; if(x>100)x=100; printf "%.0f", x}')"
-  echo "$net_score"
-}
 
-calc_disk_score() {
-  local disk_score=0
+  # disk score
   if [[ "$RUN_DISK" -eq 1 ]]; then
     if [[ "$DISK_RATING" == "GOOD" ]]; then disk_score=90
     elif [[ "$DISK_RATING" == "WARN" ]]; then disk_score=70
@@ -761,11 +711,8 @@ calc_disk_score() {
   else
     disk_score=0
   fi
-  echo "$disk_score"
-}
 
-calc_stream_score() {
-  local stream_score=0
+  # stream score
   if [[ "$RUN_STREAM" -eq 1 ]]; then
     local s=0
     [[ "$YT_OK" == "OK" ]] && ((s+=15)) || true
@@ -779,92 +726,83 @@ calc_stream_score() {
   else
     stream_score=0
   fi
-  echo "$stream_score"
-}
 
-calc_total_score() {
-  local net="$1" disk="$2" stream="$3" tcp="$4"
-  local total=0 used=0
-  # weights: net 40, tcp 25, stream 20, disk 15
-  local w_net=40 w_tcp=25 w_stream=20 w_disk=15
+  # tcp score
+  if [[ "$RUN_TCP" -eq 1 ]]; then
+    tcp_score="$(score_from_grade "$TCP_RATING")"
+  else
+    tcp_score=0
+  fi
 
+  # weights: net 35, tcp 25, disk 15, stream 25
+  local w_net=35 w_tcp=25 w_disk=15 w_stream=25
+  total=0; used=0
   if [[ "$RUN_PING" -eq 1 || "$RUN_MTR" -eq 1 ]]; then
-    total="$(awk -v t="$total" -v x="$net" -v w="$w_net" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_net)) || true
+    total="$(awk -v t="$total" -v x="$net_score" -v w="$w_net" 'BEGIN{printf "%.0f", t + x*w/100}')"
+    ((used+=w_net)) || true
   fi
   if [[ "$RUN_TCP" -eq 1 ]]; then
-    total="$(awk -v t="$total" -v x="$tcp" -v w="$w_tcp" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_tcp)) || true
-  fi
-  if [[ "$RUN_STREAM" -eq 1 ]]; then
-    total="$(awk -v t="$total" -v x="$stream" -v w="$w_stream" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_stream)) || true
+    total="$(awk -v t="$total" -v x="$tcp_score" -v w="$w_tcp" 'BEGIN{printf "%.0f", t + x*w/100}')"
+    ((used+=w_tcp)) || true
   fi
   if [[ "$RUN_DISK" -eq 1 ]]; then
-    total="$(awk -v t="$total" -v x="$disk" -v w="$w_disk" 'BEGIN{printf "%.0f", t + x*w/100}')"; ((used+=w_disk)) || true
+    total="$(awk -v t="$total" -v x="$disk_score" -v w="$w_disk" 'BEGIN{printf "%.0f", t + x*w/100}')"
+    ((used+=w_disk)) || true
   fi
-
+  if [[ "$RUN_STREAM" -eq 1 ]]; then
+    total="$(awk -v t="$total" -v x="$stream_score" -v w="$w_stream" 'BEGIN{printf "%.0f", t + x*w/100}')"
+    ((used+=w_stream)) || true
+  fi
   if [[ "$used" -gt 0 ]]; then
     total="$(awk -v t="$total" -v u="$used" 'BEGIN{printf "%.0f", t*100/u}')"
   else
     total=0
   fi
-  echo "$total"
-}
 
-overall_summary() {
-  local net_score disk_score stream_score total tcp_score
-  net_score="$(calc_net_score)"
-  disk_score="$(calc_disk_score)"
-  stream_score="$(calc_stream_score)"
-  tcp_score="$TCP_SCORE"
-  total="$(calc_total_score "$net_score" "$disk_score" "$stream_score" "$tcp_score")"
-
-  local net_g disk_g stream_g tcp_g total_g
-  net_g="$(grade_text "$net_score")"
-  disk_g="$(grade_text "$disk_score")"
-  stream_g="$(grade_text "$stream_score")"
-  tcp_g="$(grade_text "$tcp_score")"
-  total_g="$(grade_text "$total")"
-
-  local net_c disk_c stream_c tcp_c total_c
-  net_c="$(grade_color "$net_score")"
-  disk_c="$(grade_color "$disk_score")"
-  stream_c="$(grade_color "$stream_score")"
-  tcp_c="$(grade_color "$tcp_score")"
-  total_c="$(grade_color "$total")"
-
-  local host_out="$HOSTNAME_"
-  local ip_out="$IPV4_"
-  if [[ "$REDACT" -eq 1 ]]; then
-    host_out="$(mask_host "$HOSTNAME_")"
-    [[ "$IPV4_" != "unknown" ]] && ip_out="$(mask_ip "$IPV4_")"
-  fi
+  # grade & color
+  net_g="$(grade_text "$net_score")"; net_c="$(grade_color "$net_g")"
+  disk_g="$(grade_text "$disk_score")"; disk_c="$(grade_color "$disk_g")"
+  stream_g="$(grade_text "$stream_score")"; stream_c="$(grade_color "$stream_g")"
+  tcp_g="$(grade_text "$tcp_score")"; tcp_c="$(grade_color "$tcp_g")"
+  overall_g="$(grade_text "$total")"; overall_c="$(grade_color "$overall_g")"
 
   echo -e "${MAGENTA}====================== ✅ VPS 体检总结报告 ======================${NC}"
+
   echo -e "${MAGENTA}[基础信息]${NC}"
-  echo "Host : ${host_out:-unknown}"
-  echo "OS   : ${OS_:-unknown}"
-  echo "Kern : ${KERNEL_:-unknown} | Virt=${VIRT_:-unknown}"
-  echo "CPU  : ${CPU_:-unknown} | Cores=${CORES_:-?} | RAM=${RAM_:-?} | Swap=${SWAP_:-?}"
-  echo "Disk : / ${DISKROOT_:-unknown}"
-  echo "IPv4 : ${ip_out:-unknown}"
-  echo "Geo  : ${GEO_:-unknown}"
-  echo "ASN  : ${ASN_:-unknown}"
-  echo "ISP  : ${ORG_:-unknown}"
+  if [[ "$RUN_SYS" -eq 1 ]]; then
+    echo "Host : $(redact_host "${HOSTNAME_}")"
+    echo "OS   : ${OS_}"
+    echo "Kern : ${KERNEL_} | Virt=${VIRT_}"
+    echo "CPU  : ${CPU_} | Cores=${CORES_} | RAM=${RAM_} | Swap=${SWAP_}"
+    echo "Disk : / ${DISKROOT_}"
+  else
+    echo "（未执行）"
+  fi
+
+  if [[ "$RUN_IP" -eq 1 ]]; then
+    echo "IPv4 : $(redact_ip "${IPV4_}")"
+    echo "Geo  : ${GEO_}"
+    echo "ASN  : ${ASN_}"
+    echo "ISP  : ${ORG_}"
+  else
+    echo "公网信息：未执行"
+  fi
   hr
 
-  echo -e "${MAGENTA}[网络]${NC}  ${net_c}${net_score}/100（${net_g}）${NC}  $(bar "$net_score")"
+  echo -e "${MAGENTA}[网络]${NC}  ${net_score}/100 ${net_c}(${net_g})${NC}  $(bar "$net_score")"
   if [[ "$RUN_PING" -eq 1 ]]; then
-    echo "Ping : GOOD=${PING_GOOD} WARN=${PING_WARN} BAD=${PING_BAD} | worstLoss=${PING_WORST_LOSS:-?}% | worstAvg=${PING_WORST_AVG:-?}ms"
+    echo "Ping : 优秀=${PING_GOOD} 一般=${PING_WARN} 偏弱=${PING_BAD} | 最差丢包=${PING_WORST_LOSS:-?}% | 最差平均延迟=${PING_WORST_AVG:-?}ms"
   else
     echo "Ping : 未执行"
   fi
   if [[ "$RUN_MTR" -eq 1 ]]; then
-    echo "MTR  : target=${TARGETS[0]} | lastLoss=${MTR_LASTLOSS:-?}% | lastAvg=${MTR_LASTAVG:-?}ms | rating=${MTR_RATING}"
+    echo "MTR  : target=${TARGETS[0]} | 终点丢包=${MTR_LASTLOSS:-?}% | 终点平均=${MTR_LASTAVG:-?}ms | 评级=${MTR_RATING}"
   else
     echo "MTR  : 未执行"
   fi
   hr
 
-  echo -e "${MAGENTA}[TCP真实链路]${NC}  ${tcp_c}${tcp_score}/100（${tcp_g}）${NC}  $(bar "$tcp_score")"
+  echo -e "${MAGENTA}[TCP真实链路]${NC}  ${tcp_score}/100 ${tcp_c}(${tcp_g})${NC}  $(bar "$tcp_score")"
   if [[ "$RUN_TCP" -eq 1 ]]; then
     echo "TLS  : ${TCP_TLS_MS:-?} ms | TTFB=${TCP_TTFB_MS:-?} ms"
     echo "DL   : ${TCP_DL_MBPS:-?} Mbps (median, range=${TCP_RANGE_MB}MB, maxtime=${TCP_MAXTIME}s)"
@@ -874,7 +812,7 @@ overall_summary() {
   fi
   hr
 
-  echo -e "${MAGENTA}[磁盘]${NC}  ${disk_c}${disk_score}/100（${disk_g}）${NC}  $(bar "$disk_score")"
+  echo -e "${MAGENTA}[磁盘]${NC}  ${disk_score}/100 ${disk_c}(${disk_g})${NC}  $(bar "$disk_score")"
   if [[ "$RUN_DISK" -eq 1 ]]; then
     echo "dd   : ${DISK_SPEED_RAW} | approx=${DISK_MBPS:-?} MB/s | rating=${DISK_RATING}"
   else
@@ -882,7 +820,7 @@ overall_summary() {
   fi
   hr
 
-  echo -e "${MAGENTA}[流媒体]${NC}  ${stream_c}${stream_score}/100（${stream_g}）${NC}  $(bar "$stream_score")"
+  echo -e "${MAGENTA}[流媒体]${NC}  ${stream_score}/100 ${stream_c}(${stream_g})${NC}  $(bar "$stream_score")"
   if [[ "$RUN_STREAM" -eq 1 ]]; then
     echo "YouTube=${YT_OK}(CC=${YT_CC}) | 动画疯=${AG_STATUS} | Netflix=${NF_OK} | Disney+=${DP_OK} | TikTok=${TT_OK} | Prime=${PV_OK} | Max=${MX_OK}"
   else
@@ -890,15 +828,15 @@ overall_summary() {
   fi
   hr
 
-  echo -e "${MAGENTA}[总评]${NC}  ${total_c}${total}/100（${total_g}）${NC}  $(bar "$total")"
+  echo -e "${MAGENTA}[总评]${NC}  ${total}/100 ${overall_c}(${overall_g})${NC}  $(bar "$total")"
   if [[ "$total" -ge 85 ]]; then
-    ok "结论：整体素质很强，适合做中转/落地/流媒体测试/轻量服务。"
+    echo -e "${GREEN}✅ 结论：整体素质很强，适合做中转/落地/流媒体测试/轻量服务。${NC}"
   elif [[ "$total" -ge 70 ]]; then
-    ok "结论：整体不错，日常中转/落地够用，关注路由与邻居波动。"
+    echo -e "${CYAN}✅ 结论：整体不错，日常中转/落地够用，关注路由与邻居波动。${NC}"
   elif [[ "$total" -ge 55 ]]; then
-    warn "结论：整体一般，建议降低用途预期或换更稳的机房/线路。"
+    echo -e "${YELLOW}⚠️  结论：整体一般，建议降低用途预期或换机房/换商家。${NC}"
   else
-    bad "结论：整体偏弱，不建议做关键落地或高稳定需求用途。"
+    echo -e "${RED}❌ 结论：整体偏弱，不建议做关键落地或高稳定需求用途。${NC}"
   fi
 
   echo
@@ -906,7 +844,6 @@ overall_summary() {
   echo -e "${MAGENTA}================================================================${NC}"
 }
 
-# ---------- run all ----------
 run_all_verbose() {
   hr
   gather_system
@@ -915,21 +852,26 @@ run_all_verbose() {
   run_mtr
   run_disk
   run_streaming
-  run_tcp_real
+  run_tcp
   overall_summary
 }
 
-run_all_silent_report() {
-  info "正在后台执行检测（2~8+10），完成后输出最终✅总结（不刷屏）..."
+# R 静默：把详细输出丢进临时日志，屏幕只显示最终总结
+run_all_silent() {
+  info "正在后台执行检测（2~8+10），完成后输出最终✅总结..."
+  local log
+  log="$(mktemp)"
+  # 注意：用 { } 保持同进程变量不丢；不使用 ( ) 子shell
   {
-    gather_system >/dev/null 2>&1 || true
-    gather_ip >/dev/null 2>&1 || true
-    run_ping_all >/dev/null 2>&1 || true
-    run_mtr >/dev/null 2>&1 || true
-    run_disk >/dev/null 2>&1 || true
-    run_streaming >/dev/null 2>&1 || true
-    run_tcp_real >/dev/null 2>&1 || true
-  } || true
+    gather_system >/dev/null
+    gather_ip >/dev/null
+    run_ping_all >/dev/null
+    run_mtr >/dev/null
+    run_disk >/dev/null
+    run_streaming >/dev/null
+    run_tcp >/dev/null
+  } >"$log" 2>&1 || true
+  rm -f "$log" >/dev/null 2>&1 || true
   overall_summary
 }
 
@@ -964,16 +906,10 @@ menu() {
       7) run_disk; pause ;;
       8) run_streaming; pause ;;
       9) run_all_verbose; pause ;;
-      10) run_tcp_real; pause ;;
-      r|R) run_all_silent_report; pause ;;
-      0|q|Q)
-        ok "Bye."
-        exit 0
-        ;;
-      *)
-        warn "无效选择：${c:-空}（请输入 0-10 或 R）"
-        pause
-        ;;
+      10) run_tcp; pause ;;
+      r|R) run_all_silent; pause ;;
+      0|q|Q) ok "Bye."; exit 0 ;;
+      *) warn "无效选择：${c:-空}（请输入 0-10 或 R）"; pause ;;
     esac
   done
 }
