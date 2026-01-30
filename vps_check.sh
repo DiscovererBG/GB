@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# VPS 一键体检（稳定修复版）
+# - 修复：bash 语法错误（local ok()）
+# - 9 全跑不中断；R 真后台静默全跑
+# - 进度条：彩色块 + 灰点 '.'（避免 ???）
+# - 修复：awk 报错/丢包显示 loss%/403000/301/302 判定/dd 假速度/颜色丢失/ANSI 残留
+# - 最终总结：基础信息全中文 + 自动识别国家中文
 
-# ---------------- Locale（尽量 UTF-8，避免 ????） ----------------
+# ---------------- Locale ----------------
 if command -v locale >/dev/null 2>&1; then
   if locale -a 2>/dev/null | grep -qi '^c\.utf-8$'; then
     export LANG=C.UTF-8 LC_ALL=C.UTF-8
@@ -15,7 +21,7 @@ else
   export LANG=C LC_ALL=C
 fi
 
-# ---------------- Colors（全部用 $'\033'，杜绝 \033[0m 残留） ----------------
+# ---------------- Colors ----------------
 ESC=$'\033'
 RESET="${ESC}[0m"
 BOLD="${ESC}[1m"
@@ -28,13 +34,11 @@ FG_GREEN="${ESC}[38;5;82m"
 FG_YELLOW="${ESC}[38;5;220m"
 FG_RED="${ESC}[38;5;196m"
 FG_GRAY="${ESC}[38;5;245m"
-FG_WHITE="${ESC}[38;5;255m"
 
 BG_GREEN="${ESC}[48;5;112m"
 BG_CYAN="${ESC}[48;5;44m"
 BG_YELLOW="${ESC}[48;5;214m"
 BG_RED="${ESC}[48;5;161m"
-BG_GRAY="${ESC}[48;5;238m"
 
 # ---------------- Settings ----------------
 TARGETS=("1.1.1.1" "8.8.8.8" "www.google.com")
@@ -54,8 +58,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 REDACT=0
 [[ "${1:-}" == "--redact" ]] && REDACT=1
 
-QUIET=0          # R 模式会设为 1（不刷屏）
-PAUSE_ENABLE=1   # R 模式会设为 0（不暂停）
+QUIET=0
+PAUSE_ENABLE=1
 
 # ---------------- Print helpers ----------------
 p()  { printf "%b" "$*"; }
@@ -63,7 +67,6 @@ pl() { [[ "$QUIET" -eq 1 ]] && return 0; printf "%b\n" "$*"; }
 pl_force() { printf "%b\n" "$*"; }
 
 hr()  { pl "${FG_PINK}---------------------------------------------------------${RESET}"; }
-hr2() { pl "${FG_PINK}=========================================================${RESET}"; }
 
 pause() {
   [[ "$PAUSE_ENABLE" -eq 0 ]] && return 0
@@ -113,7 +116,6 @@ grade_colored_label() {
   printf "%b%s%b" "$fg" "$(grade_label "$s")" "$RESET"
 }
 
-# 进度条（彩色块+灰点 '.'），避免 '·' 变 ???；不用 '='
 bar() {
   local score="${1:-0}"
   local width="${2:-28}"
@@ -136,7 +138,6 @@ bar() {
   p "${RESET}${fg}]${RESET}"
 }
 
-# ---------------- Utils ----------------
 f2() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x+0}'; }
 f1() { awk -v x="${1:-0}" 'BEGIN{printf "%.1f", x+0}'; }
 
@@ -156,7 +157,6 @@ median_of_list() {
 }
 
 country_zh() {
-  # ISO -> 中文（够用版本，常见国家先覆盖；未知返回原码）
   local cc="${1:-}"
   case "$cc" in
     SG) echo "新加坡" ;;
@@ -190,7 +190,7 @@ country_zh() {
   esac
 }
 
-# ---------------- Global cached results（保证“最后输出基础信息一致”） ----------------
+# ---------------- Cached results ----------------
 B_HOST=""; B_OS=""; B_KERN=""; B_UPTIME=""; B_VIRT=""; B_CPU=""; B_CORES=""
 B_RAM=""; B_SWAP=""; B_DISK=""
 
@@ -259,7 +259,7 @@ do_basic() {
   hr
 }
 
-# ---------------- Step 3: 公网信息（国家中文） ----------------
+# ---------------- Step 3: 公网信息 ----------------
 do_public() {
   pl "${FG_CYAN}ℹ️  开始：公网信息${RESET}"
 
@@ -281,7 +281,6 @@ do_public() {
   [[ -z "$P_COUNTRY_CODE" ]] && P_COUNTRY_CODE="未知"
   P_COUNTRY_ZH="$(country_zh "$P_COUNTRY_CODE")"
 
-  # org: "AS20473 The Constant Company, LLC"
   P_ASN="$(printf "%s" "$P_ORG" | awk '{print $1}' 2>/dev/null || true)"
   P_ISP="$(printf "%s" "$P_ORG" | sed -E 's/^AS[0-9]+[ ]*//' 2>/dev/null || true)"
   [[ -z "$P_ASN" ]] && P_ASN="未知"
@@ -295,17 +294,15 @@ do_public() {
   hr
 }
 
-# ---------------- Step 4: Ping（修复 awk 报错/丢包 loss%） ----------------
+# ---------------- Step 4: Ping ----------------
 ping_one() {
   local t="$1"
   local out loss min avg max mdev
   out="$(LANG=C ping -c "$PING_COUNT" -q "$t" 2>/dev/null || true)"
 
-  # 丢包：从 "XX% packet loss" 提取
   loss="$(printf "%s\n" "$out" | sed -n 's/.* \([0-9.]\+\)% packet loss.*/\1/p' | tail -n1)"
   [[ -z "$loss" ]] && loss="未知"
 
-  # RTT：从 "min/avg/max/mdev = a/b/c/d ms" 提取
   local rttline
   rttline="$(printf "%s\n" "$out" | grep -E 'rtt |round-trip ' | tail -n1 || true)"
   if [[ -n "$rttline" ]]; then
@@ -322,7 +319,6 @@ ping_one() {
   pl "丢包 : ${loss}%"
   pl "RTT  : min=${min}ms  avg=${avg}ms  max=${max}ms  mdev=${mdev}ms"
 
-  # 评价（不中断）
   local s=0
   if [[ "$loss" != "未知" && "$avg" != "未知" ]]; then
     local lossn avgn
@@ -359,7 +355,6 @@ ping_one() {
     fi
   fi
 
-  # worst
   if [[ "$loss" != "未知" ]]; then
     if [[ -z "$PING_WORST_LOSS" ]]; then
       PING_WORST_LOSS="$loss"
@@ -392,7 +387,7 @@ do_ping_all() {
   hr
 }
 
-# ---------------- Step 6/5: mtr 安装/测试（不中断） ----------------
+# ---------------- MTR install/test ----------------
 do_mtr_install() {
   pl "${FG_CYAN}ℹ️  正在安装 mtr...${RESET}"
   if exists apt-get; then
@@ -409,8 +404,8 @@ do_mtr_install() {
 
 do_mtr() {
   MTR_TARGET="${TARGETS[0]}"
-
   pl "${FG_CYAN}ℹ️  开始：MTR 测试${RESET}"
+
   if ! exists mtr; then
     pl "${FG_YELLOW}⚠️  未检测到 mtr，尝试自动安装...${RESET}"
     do_mtr_install || true
@@ -432,7 +427,6 @@ do_mtr() {
     return 0
   fi
 
-  # 展示（少刷屏）
   printf "%s\n" "$out" | sed -n '1,20p' | while IFS= read -r line; do pl "$line"; done
   if (( $(printf "%s\n" "$out" | wc -l) > 26 )); then
     pl "${FG_GRAY}...(中间省略)...${RESET}"
@@ -468,7 +462,7 @@ do_mtr() {
 
   pl
   pl "终点（最后一跳）：丢包=${MTR_LAST_LOSS}%  平均=${MTR_LAST_AVG}ms"
-  pl "${FG_CYAN}ℹ️  提示：中间跳丢包高但最后一跳 0% 多为 ICMP 限速（假丢包），通常不影响真实流量。${RESET}"
+  pl "${FG_CYAN}ℹ️  提示：中间跳丢包高但最后一跳 0% 多为 ICMP 限速（假丢包）。${RESET}"
   if (( s >= 90 )); then
     pl "${FG_GREEN}✅ 路由质量：优秀${RESET}"
   elif (( s >= 60 )); then
@@ -479,35 +473,31 @@ do_mtr() {
   hr
 }
 
-# ---------------- Step 7: dd（修复“0.37MB/s”假结果：无 speed 就自己算） ----------------
+# ---------------- dd ----------------
 do_dd() {
   pl "${FG_CYAN}ℹ️  开始：磁盘 dd 测试${RESET}"
   pl "${FG_PURPLE}--- 磁盘快速测试（dd 写入 ${DD_SIZE_MB}MB 到 /tmp）---${RESET}"
 
-  local out bytes time_s speed_val speed_unit mbps
+  local out time_s speed_val speed_unit mbps
   out="$(LANG=C dd if=/dev/zero of="$TMPDIR/dd_test" bs=1M count="$DD_SIZE_MB" conv=fdatasync 2>&1 || true)"
   rm -f "$TMPDIR/dd_test" >/dev/null 2>&1 || true
 
-  bytes=$((DD_SIZE_MB*1024*1024))
   time_s="$(printf "%s\n" "$out" | sed -n 's/.*copied, \([0-9.]\+\) s.*/\1/p' | tail -n1 || true)"
-
-  # 先尝试直接读 speed（有些 dd 输出：..., 0.16 s, 1.6 GB/s）
   read -r speed_val speed_unit < <(printf "%s\n" "$out" \
     | sed -n 's/.*copied, [0-9.]\+ s, \([0-9.]\+\) \([kMG]B\/s\).*/\1 \2/p' \
     | tail -n1 || true)
 
   if [[ -n "${speed_val:-}" && -n "${speed_unit:-}" ]]; then
     if [[ "$speed_unit" == "GB/s" ]]; then
-      mbps="$(awk -v x="$speed_val" 'BEGIN{printf "%.2f", x*1024}' )"
+      mbps="$(awk -v x="$speed_val" 'BEGIN{printf "%.2f", x*1024}')"
     elif [[ "$speed_unit" == "MB/s" ]]; then
-      mbps="$(awk -v x="$speed_val" 'BEGIN{printf "%.2f", x}' )"
+      mbps="$(awk -v x="$speed_val" 'BEGIN{printf "%.2f", x}')"
     else
       mbps=""
     fi
   else
-    # dd 没给 speed：自己算
     if [[ -n "${time_s:-}" ]]; then
-      mbps="$(awk -v b="$DD_SIZE_MB" -v t="$time_s" 'BEGIN{if(t>0) printf "%.2f", (b/t); else print ""}' )"
+      mbps="$(awk -v b="$DD_SIZE_MB" -v t="$time_s" 'BEGIN{if(t>0) printf "%.2f", (b/t); else print ""}')"
     else
       mbps=""
     fi
@@ -522,8 +512,6 @@ do_dd() {
   fi
 
   DD_MBPS="$mbps"
-
-  # scoring
   if awk -v x="$mbps" 'BEGIN{exit !(x>=1500)}'; then
     DD_SCORE=95
     pl "结果：约 ${mbps} MB/s"
@@ -544,16 +532,17 @@ do_dd() {
   hr
 }
 
-# ---------------- Step 8: 流媒体（修复 403000/301 判断） ----------------
+# ---------------- media（修复 local ok() 语法错误） ----------------
 curl_code() {
-  # 只输出三位 http_code；失败输出 000
   local url="$1"
   local code
   code="$(curl -fsS --max-time 8 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo "000")"
-  # 防止意外拼接：只取前三位数字
   code="$(printf "%s" "$code" | tr -cd '0-9' | head -c 3)"
   [[ -z "$code" ]] && code="000"
   printf "%s" "$code"
+}
+is_ok_code() {
+  [[ "$1" == "200" || "$1" == "301" || "$1" == "302" ]]
 }
 
 do_media() {
@@ -568,24 +557,21 @@ do_media() {
   pm="$(curl_code "https://www.primevideo.com/")"
   hb="$(curl_code "https://play.max.com/")"
 
-  # 评分（保守）
   local score=0
-  local ok() { [[ "$1" == "200" || "$1" == "302" || "$1" == "301" ]]; }
-  ok "$yt" && score=$((score+15))
-  ok "$nf" && score=$((score+15))
-  ok "$ds" && score=$((score+15))
-  ok "$tk" && score=$((score+10))
-  ok "$pm" && score=$((score+15))
-  ok "$hb" && score=$((score+15))
+  is_ok_code "$yt" && score=$((score+15))
+  is_ok_code "$nf" && score=$((score+15))
+  is_ok_code "$ds" && score=$((score+15))
+  is_ok_code "$tk" && score=$((score+10))
+  is_ok_code "$pm" && score=$((score+15))
+  is_ok_code "$hb" && score=$((score+15))
   ((score>100)) && score=100
 
-  # 输出（中文）
-  if ok "$yt"; then pl "${FG_GREEN}✅ YouTube: 可访问${RESET}"; else pl "${FG_RED}❌ YouTube: 不可用（HTTP $yt）${RESET}"; fi
-  if ok "$nf"; then pl "${FG_GREEN}✅ Netflix: 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Netflix: 不可用（HTTP $nf）${RESET}"; fi
-  if ok "$ds"; then pl "${FG_GREEN}✅ Disney+: 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Disney+: 不可用（HTTP $ds）${RESET}"; fi
-  if ok "$tk"; then pl "${FG_YELLOW}⚠️  TikTok: 可访问但可能受风控/Cloudflare 影响（HTTP $tk）${RESET}"; else pl "${FG_RED}❌ TikTok: 不可用（HTTP $tk）${RESET}"; fi
-  if ok "$pm"; then pl "${FG_GREEN}✅ Prime: 可访问（片库看账号地区）${RESET}"; else pl "${FG_RED}❌ Prime: 不可用（HTTP $pm）${RESET}"; fi
-  if ok "$hb"; then pl "${FG_GREEN}✅ Max(HBO): 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Max(HBO): 不可用（HTTP $hb）${RESET}"; fi
+  if is_ok_code "$yt"; then pl "${FG_GREEN}✅ YouTube: 可访问${RESET}"; else pl "${FG_RED}❌ YouTube: 不可用（HTTP $yt）${RESET}"; fi
+  if is_ok_code "$nf"; then pl "${FG_GREEN}✅ Netflix: 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Netflix: 不可用（HTTP $nf）${RESET}"; fi
+  if is_ok_code "$ds"; then pl "${FG_GREEN}✅ Disney+: 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Disney+: 不可用（HTTP $ds）${RESET}"; fi
+  if is_ok_code "$tk"; then pl "${FG_YELLOW}⚠️  TikTok: 可访问但可能受风控/Cloudflare 影响（HTTP $tk）${RESET}"; else pl "${FG_RED}❌ TikTok: 不可用（HTTP $tk）${RESET}"; fi
+  if is_ok_code "$pm"; then pl "${FG_GREEN}✅ Prime: 可访问（片库看账号地区）${RESET}"; else pl "${FG_RED}❌ Prime: 不可用（HTTP $pm）${RESET}"; fi
+  if is_ok_code "$hb"; then pl "${FG_GREEN}✅ Max(HBO): 可访问（最终以登录播放为准）${RESET}"; else pl "${FG_RED}❌ Max(HBO): 不可用（HTTP $hb）${RESET}"; fi
 
   pl "${FG_CYAN}ℹ️  提示：最终以“登录播放”结果为准。${RESET}"
 
@@ -594,23 +580,19 @@ do_media() {
   hr
 }
 
-# ---------------- Step 10: TCP 多源（不依赖 asort） ----------------
+# ---------------- TCP ----------------
 tcp_test_one() {
   local src="$1"
-  local url="" host=""
+  local url=""
   case "$src" in
     cloudflare) url="https://speed.cloudflare.com/__down?bytes=$((TCP_RANGE_MB*1024*1024))";;
     hetzner)    url="https://speed.hetzner.de/100MB.bin";;
     ovh)        url="https://proof.ovh.net/files/100Mb.dat";;
     cachefly)   url="https://cachefly.cachefly.net/100mb.test";;
-    *) return 1;;
+    *) echo "$src FAIL"; return 0;;
   esac
 
-  # TLS/TTFB/下载
-  # 下载使用 Range 限制（避免跑满/被限速），并且 max-time 限制
-  local tls ttfb dl code
-  # curl -w time_appconnect/time_starttransfer/speed_download/http_code
-  local w
+  local w tls ttfb dl code
   w="$(curl -L -sS --max-time "$TCP_MAXTIME" --range "0-$((TCP_RANGE_MB*1024*1024-1))" -o /dev/null \
       -w '%{time_appconnect} %{time_starttransfer} %{speed_download} %{http_code}' \
       "$url" 2>/dev/null || echo "")"
@@ -621,30 +603,26 @@ tcp_test_one() {
   fi
 
   read -r tls ttfb dl code <<<"$w"
-  # code 只要 3 位
   code="$(printf "%s" "${code:-000}" | tr -cd '0-9' | head -c 3)"
   [[ -z "$code" ]] && code="000"
 
-  # speed_download: bytes/s -> Mbps
   if [[ -n "${dl:-}" && "${dl:-0}" != "0" ]]; then
-    dl="$(awk -v b="$dl" 'BEGIN{printf "%.2f", (b*8)/1000000}' )"
+    dl="$(awk -v b="$dl" 'BEGIN{printf "%.2f", (b*8)/1000000}')"
   else
     dl=""
   fi
 
-  # tls/ttfb: seconds -> ms
   if [[ -n "${tls:-}" && "${tls:-0}" != "0" ]]; then
-    tls="$(awk -v s="$tls" 'BEGIN{printf "%.0f", s*1000}' )"
+    tls="$(awk -v s="$tls" 'BEGIN{printf "%.0f", s*1000}')"
   else
     tls=""
   fi
   if [[ -n "${ttfb:-}" && "${ttfb:-0}" != "0" ]]; then
-    ttfb="$(awk -v s="$ttfb" 'BEGIN{printf "%.0f", s*1000}' )"
+    ttfb="$(awk -v s="$ttfb" 'BEGIN{printf "%.0f", s*1000}')"
   else
     ttfb=""
   fi
 
-  # 判定有效
   if [[ "$code" == "200" || "$code" == "206" ]]; then
     echo "$src OK $tls $ttfb $dl $code"
   else
@@ -657,7 +635,10 @@ do_tcp() {
   pl "${FG_PURPLE}--- TCP 真实链路测试 ---${RESET}"
   pl "${FG_CYAN}范围：${TCP_RANGE_MB}MB | 超时：${TCP_MAXTIME}s | 多源测速${RESET}"
 
-  local tls_list="" ttfb_list="" dl_list=""
+  : >"$TMPDIR/tls.list" 2>/dev/null || true
+  : >"$TMPDIR/ttfb.list" 2>/dev/null || true
+  : >"$TMPDIR/dl.list" 2>/dev/null || true
+
   TCP_OK_SAMPLES=0
   TCP_BEST_SRC=""
   local best_dl=0
@@ -673,7 +654,6 @@ do_tcp() {
       printf "%s\n" "$ttfb" >>"$TMPDIR/ttfb.list"
       printf "%s\n" "$dl"   >>"$TMPDIR/dl.list"
 
-      # best
       if awk -v a="$dl" -v b="$best_dl" 'BEGIN{exit !(a>b)}'; then
         best_dl="$dl"
         TCP_BEST_SRC="$src"
@@ -702,7 +682,6 @@ do_tcp() {
   TCP_TTFB_MS="${mttfb}"
   TCP_DL_MBPS="${mdl}"
 
-  # score：主要看下载（中位数）
   local s=0
   if awk -v x="$mdl" 'BEGIN{exit !(x>=200)}'; then
     s=90
@@ -729,12 +708,10 @@ do_tcp() {
   hr
 }
 
-# ---------------- Summary（最终基础信息全中文 + 颜色正常 + 进度条正确） ----------------
+# ---------------- Summary ----------------
 summary_report() {
-  # 网络分：用 ping 为主，mtr 有就加权
-  local net_score=0
+  local net_score=60
   if [[ -n "${PING_WORST_LOSS:-}" && "${PING_WORST_LOSS:-}" != "未知" && -n "${PING_WORST_AVG:-}" && "${PING_WORST_AVG:-}" != "未知" ]]; then
-    # 简单按 ping 最差估算
     if awk -v l="$PING_WORST_LOSS" 'BEGIN{exit !(l<=1)}' && awk -v a="$PING_WORST_AVG" 'BEGIN{exit !(a<80)}'; then
       net_score=95
     elif awk -v l="$PING_WORST_LOSS" 'BEGIN{exit !(l<=3)}' && awk -v a="$PING_WORST_AVG" 'BEGIN{exit !(a<150)}'; then
@@ -744,11 +721,7 @@ summary_report() {
     else
       net_score=40
     fi
-  else
-    net_score=60
   fi
-
-  # mtr 可用则略提升/校正
   if [[ "${MTR_LAST_LOSS:-未知}" != "未知" && "${MTR_LAST_AVG:-未知}" != "未知" && "$MTR_SCORE" -gt 0 ]]; then
     net_score=$(( (net_score*7 + MTR_SCORE*3) / 10 ))
   fi
@@ -771,7 +744,6 @@ summary_report() {
   pl_force "运营商 : ${P_ISP}"
   pl_force "${FG_PINK}---------------------------------------------------------${RESET}"
 
-  # 网络
   pl_force "[网络]  ${net_score}/100  ($(grade_colored_label "$net_score"))  $(bar "$net_score")"
   pl_force "Ping : 优秀=${PING_GOOD} 一般=${PING_WARN} 偏弱=${PING_BAD} | 最差丢包=${PING_WORST_LOSS:-未知}% | 最差平均延迟=${PING_WORST_AVG:-未知}ms"
   if [[ "${MTR_LAST_LOSS:-未知}" != "未知" ]]; then
@@ -781,19 +753,16 @@ summary_report() {
   fi
   pl_force "${FG_PINK}---------------------------------------------------------${RESET}"
 
-  # TCP
   pl_force "[TCP真实链路]  ${TCP_SCORE}/100  ($(grade_colored_label "$TCP_SCORE"))  $(bar "$TCP_SCORE")"
   pl_force "TLS  : ${TCP_TLS_MS:-未知}ms | TTFB=${TCP_TTFB_MS:-未知}ms"
   pl_force "下载 : ${TCP_DL_MBPS:-未知}Mbps（中位数，${TCP_RANGE_MB}MB，超时=${TCP_MAXTIME}s）"
   pl_force "样本 : ${TCP_OK_SAMPLES:-0} 个 | 最佳源=${TCP_BEST_SRC:-unknown}"
   pl_force "${FG_PINK}---------------------------------------------------------${RESET}"
 
-  # 磁盘
   pl_force "[磁盘]  ${DD_SCORE}/100  ($(grade_colored_label "$DD_SCORE"))  $(bar "$DD_SCORE")"
   pl_force "dd   : 约 ${DD_MBPS:-未知} MB/s（写入 /tmp ${DD_SIZE_MB}MB）"
   pl_force "${FG_PINK}---------------------------------------------------------${RESET}"
 
-  # 流媒体
   pl_force "[流媒体]  ${MEDIA_SCORE}/100  ($(grade_colored_label "$MEDIA_SCORE"))  $(bar "$MEDIA_SCORE")"
   pl_force "${MEDIA_LINE}"
   pl_force "${FG_PINK}---------------------------------------------------------${RESET}"
@@ -804,9 +773,7 @@ summary_report() {
   pl_force "${FG_PINK}=========================================================${RESET}"
 }
 
-# ---------------- Runner（9 全跑 / R 静默全跑） ----------------
 run_all_steps() {
-  # 所有步骤都“尽量成功”，绝不因为某一步退出
   do_basic   || true
   do_public  || true
   do_ping_all|| true
@@ -825,7 +792,6 @@ run_full_verbose() {
 }
 
 run_full_silent() {
-  # 真静默：不刷屏，只输出最终总结
   QUIET=1
   PAUSE_ENABLE=0
   run_all_steps >/dev/null 2>&1 || true
@@ -834,7 +800,6 @@ run_full_silent() {
   PAUSE_ENABLE=1
 }
 
-# ---------------- Menu（去掉括号说明，保持干净） ----------------
 menu() {
   pl "${FG_PINK}==================== VPS 一键体检 菜单 ====================${RESET}"
   pl "Targets: ${FG_PURPLE}${TARGETS[0]}${RESET} ${FG_PURPLE}${TARGETS[1]}${RESET} ${FG_PURPLE}${TARGETS[2]}${RESET}"
