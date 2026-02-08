@@ -1,105 +1,88 @@
-#!/usr/bin/env bash
-# ===============================
-# VPS 一键备份与恢复脚本（安全版）
-# GitHub 友好，无敏感信息
-# ===============================
+#!/bin/bash
+# =========================================
+# VPS 全量备份与恢复菜单脚本 (安全版)
+# 可备份整个 VPS 根目录，安全隐私
+# =========================================
+set -e
 
-set -euo pipefail
+# 默认备份存放目录
+BACKUP_DIR="/root/vps_backups"
 
-# 备份存放目录
-BACKUP_DIR="${BACKUP_DIR:-/root/vps-backup}"
+# 创建备份目录（如果不存在）
 mkdir -p "$BACKUP_DIR"
 
-# 排除目录（包含敏感信息）
-EXCLUDE_DIRS="--exclude=/proc --exclude=/sys --exclude=/dev --exclude=/tmp --exclude=/run \
---exclude=/mnt --exclude=/media --exclude=/lost+found \
---exclude=/root/.ssh --exclude=/etc/ssl/private --exclude=$BACKUP_DIR"
+# 获取当前日期
+DATE=$(date +%F)
 
-function backup_vps() {
-    DATE=$(date +%F-%H%M)
+# --------------------------
+# 函数：备份 VPS
+# --------------------------
+backup_vps() {
     BACKUP_FILE="$BACKUP_DIR/vps-backup-$DATE.tar.gz"
+    echo "正在备份整个 VPS 根目录..."
+    echo "注意：备份会排除 /proc /sys /dev /tmp /run 和备份目录本身"
+    echo "请耐心等待，视 VPS 数据量大小而定..."
 
-    echo "📦 正在备份 VPS 到 $BACKUP_FILE ..."
+    tar -czpf "$BACKUP_FILE" \
+        --exclude=/proc \
+        --exclude=/sys \
+        --exclude=/dev \
+        --exclude=/tmp \
+        --exclude=/run \
+        --exclude="$BACKUP_DIR" \
+        /
 
-    # 备份防火墙配置
-    iptables-save > "$BACKUP_DIR/iptables-backup-$DATE.rules"
-    echo "🔥 防火墙配置已备份"
-
-    # 备份 sysctl 配置
-    cp /etc/sysctl.conf "$BACKUP_DIR/sysctl-backup-$DATE.conf"
-    echo "⚙️ 系统内核参数已备份"
-
-    # 全量系统备份
-    tar -czpf "$BACKUP_FILE" $EXCLUDE_DIRS /
-    
-    echo "✅ VPS 备份完成: $BACKUP_FILE"
-    echo "📂 防火墙规则和系统参数已单独保存"
+    echo
+    echo "✅ 备份完成！"
+    echo "备份文件已保存到：$BACKUP_FILE"
 }
 
-function restore_vps() {
-    if [ $# -lt 1 ]; then
-        echo "请指定备份文件路径: $0 restore /path/to/vps-backup.tar.gz"
-        exit 1
+# --------------------------
+# 函数：恢复 VPS
+# --------------------------
+restore_vps() {
+    echo "可用备份文件列表："
+    ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null || { echo "没有找到备份文件！"; return; }
+
+    read -rp "请输入要恢复的备份文件名（完整路径或文件名）: " FILE
+    # 自动补全路径
+    [[ ! "$FILE" =~ ^/ ]] && FILE="$BACKUP_DIR/$FILE"
+
+    if [[ ! -f "$FILE" ]]; then
+        echo "❌ 备份文件不存在！"
+        return
     fi
 
-    BACKUP_FILE="$1"
-    DATE=$(date +%F-%H%M)
-
-    if [ ! -f "$BACKUP_FILE" ]; then
-        echo "❌ 备份文件不存在: $BACKUP_FILE"
-        exit 1
-    fi
-
-    echo "⚠️ 恢复操作会覆盖 VPS 文件系统！"
-    read -p "输入 YES 执行恢复: " CONFIRM
-    if [ "$CONFIRM" != "YES" ]; then
+    echo "⚠️ 注意：恢复操作会覆盖 VPS 当前文件！"
+    read -rp "确认恢复？输入 yes 继续: " CONFIRM
+    if [[ "$CONFIRM" != "yes" ]]; then
         echo "已取消恢复"
-        exit 0
+        return
     fi
 
-    echo "📥 正在解压备份..."
-    tar -xzpf "$BACKUP_FILE" -C /
-
-    # 恢复 sysctl 配置
-    SYSCTL_FILE=$(ls "$BACKUP_DIR"/sysctl-backup-*.conf | tail -n1 || true)
-    if [ -f "$SYSCTL_FILE" ]; then
-        cp "$SYSCTL_FILE" /etc/sysctl.conf
-        sysctl -p
-        echo "⚙️ 系统内核参数恢复完成"
-    fi
-
-    # 恢复防火墙
-    IPT_FILE=$(ls "$BACKUP_DIR"/iptables-backup-*.rules | tail -n1 || true)
-    if [ -f "$IPT_FILE" ]; then
-        iptables-restore < "$IPT_FILE"
-        echo "🔥 防火墙规则恢复完成"
-    fi
-
-    # 确保 IP 转发开启
-    echo 1 > /proc/sys/net/ipv4/ip_forward
-    sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    sysctl -p
-    echo "🔀 IP 转发已开启"
-
-    echo "💾 恢复完成！请检查服务状态、网络和端口映射"
+    echo "正在恢复..."
+    tar -xzpf "$FILE" -C /
+    echo "✅ 恢复完成！"
+    echo "建议重启 VPS 以确保系统正常运行"
 }
 
-# 主程序
-if [ $# -lt 1 ]; then
-    echo "用法: $0 backup|restore [备份文件]"
-    exit 1
-fi
-
-case "$1" in
-    backup)
-        backup_vps
-        ;;
-    restore)
-        restore_vps "${2:-}"
-        ;;
-    *)
-        echo "未知参数: $1"
-        echo "用法: $0 backup|restore [备份文件]"
-        exit 1
-        ;;
-esac
+# --------------------------
+# 主菜单循环
+# --------------------------
+while true; do
+    echo "==============================="
+    echo "      VPS 备份与恢复管理       "
+    echo "==============================="
+    echo "1) 备份整个 VPS"
+    echo "2) 恢复 VPS"
+    echo "3) 查看备份文件列表"
+    echo "4) 退出"
+    read -rp "请输入选项: " CHOICE
+    case "$CHOICE" in
+        1) backup_vps ;;
+        2) restore_vps ;;
+        3) ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null || echo "没有备份文件" ;;
+        4) exit 0 ;;
+        *) echo "❌ 无效选项，请重新输入" ;;
+    esac
+done
