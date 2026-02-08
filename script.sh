@@ -1,7 +1,8 @@
 #!/bin/bash
 # ==============================================
-# VPS 全量备份与恢复脚本（安全版+美化菜单+自动创建目录+自动清理旧备份+手动清理+备份完成时间）
+# VPS 全量备份与恢复脚本（安全版+美化菜单+自动创建目录+自动清理+备份完成时间+可访问目录）
 # ==============================================
+
 # ==============================================
 
 # ===============================
@@ -10,11 +11,11 @@
 BACKUP_DIR="/home/ccbg/backup"
 DATE=$(date +%F)
 
-# 自动创建备份目录，权限安全
+# 自动创建备份目录，权限 755，方便普通用户进入
 if [ ! -d "$BACKUP_DIR" ]; then
     echo "备份目录 $BACKUP_DIR 不存在，正在创建..."
     mkdir -p "$BACKUP_DIR"
-    chmod 700 "$BACKUP_DIR"
+    chmod 755 "$BACKUP_DIR"   # 普通用户可以进入
     echo "目录创建完成！"
 fi
 
@@ -40,8 +41,12 @@ backup() {
         --exclude=/dev \
         --exclude=/tmp \
         --exclude=/run \
+        --exclude="$BACKUP_DIR" \
         --one-file-system \
         / 2>/dev/null
+
+    # 设置备份文件权限，只有拥有者可读写
+    chmod 600 "$FILE"
 
     END_TIME=$(date +"%Y-%m-%d %H:%M:%S")
     if [ $? -eq 0 ]; then
@@ -71,7 +76,7 @@ restore() {
     if [ ! -d "$RESTORE_DIR" ]; then
         echo "备份文件所在目录 $RESTORE_DIR 不存在，正在创建..."
         mkdir -p "$RESTORE_DIR"
-        chmod 700 "$RESTORE_DIR"
+        chmod 755 "$RESTORE_DIR"
         echo "目录创建完成！"
     fi
 
