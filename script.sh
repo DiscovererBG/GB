@@ -1,15 +1,13 @@
 #!/bin/bash
 # ==============================================
-# VPS 全量备份与恢复脚本（安全版+美化菜单+自动创建目录+自动清理旧备份+手动清理）
+# VPS 全量备份与恢复脚本（安全版+美化菜单+自动创建目录+自动清理旧备份+手动清理+备份完成时间）
 # ==============================================
-# 备份保存到 /home/backup，非 root，方便下载
-# 可通过 Web 访问：http://<VPS_IP>/backup/
 # ==============================================
 
 # ===============================
 # 配置
 # ===============================
-BACKUP_DIR="/home/backup"
+BACKUP_DIR="/home/ccbg/backup"
 DATE=$(date +%F)
 
 # 自动创建备份目录，权限安全
@@ -32,7 +30,10 @@ NC='\033[0m' # No Color
 # ===============================
 backup() {
     FILE="$BACKUP_DIR/vps-backup-$DATE.tar.gz"
+    START_TIME=$(date +"%Y-%m-%d %H:%M:%S")
     echo -e "${BLUE}开始备份 VPS 到 ${FILE} ...${NC}"
+    echo "开始时间：$START_TIME"
+
     tar -czpf "$FILE" \
         --exclude=/proc \
         --exclude=/sys \
@@ -42,9 +43,12 @@ backup() {
         --one-file-system \
         / 2>/dev/null
 
+    END_TIME=$(date +"%Y-%m-%d %H:%M:%S")
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}备份完成！${NC}"
         echo "备份文件位置：$FILE"
+        echo "开始时间：$START_TIME"
+        echo "完成时间：$END_TIME"
         ls -lh "$FILE"
 
         # 自动清理 2 天前的备份
@@ -60,7 +64,7 @@ backup() {
 # 恢复函数
 # ===============================
 restore() {
-    echo -e "${YELLOW}请输入要恢复的备份文件完整路径（例如 /home/backup/vps-backup-2026-02-08.tar.gz）：${NC}"
+    echo -e "${YELLOW}请输入要恢复的备份文件完整路径（例如 /home/ccbg/backup/vps-backup-2026-02-08.tar.gz）：${NC}"
     read -r RESTORE_FILE
 
     RESTORE_DIR=$(dirname "$RESTORE_FILE")
