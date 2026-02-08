@@ -1,88 +1,90 @@
 #!/bin/bash
-# =========================================
-# VPS 全量备份与恢复菜单脚本 (安全版)
-# 可备份整个 VPS 根目录，安全隐私
-# =========================================
-set -e
+# ===============================
+# VPS 全量备份与恢复菜单脚本
+# 安全、隐私、可靠
+# ===============================
 
-# 默认备份存放目录
-BACKUP_DIR="/root/vps_backups"
+# 备份目录
+BACKUP_DIR="/root/vps-backups"
 
-# 创建备份目录（如果不存在）
+# 排除目录
+EXCLUDE_DIRS="/proc /sys /dev /tmp /run /mnt /media /lost+found"
+
+# 确保备份目录存在
 mkdir -p "$BACKUP_DIR"
 
-# 获取当前日期
-DATE=$(date +%F)
+# 生成备份文件名
+generate_backup_name() {
+    echo "$BACKUP_DIR/vps-backup-$(date +%F-%H%M%S).tar.gz"
+}
 
-# --------------------------
-# 函数：备份 VPS
-# --------------------------
+# 全量备份函数
 backup_vps() {
-    BACKUP_FILE="$BACKUP_DIR/vps-backup-$DATE.tar.gz"
-    echo "正在备份整个 VPS 根目录..."
-    echo "注意：备份会排除 /proc /sys /dev /tmp /run 和备份目录本身"
-    echo "请耐心等待，视 VPS 数据量大小而定..."
-
-    tar -czpf "$BACKUP_FILE" \
-        --exclude=/proc \
-        --exclude=/sys \
-        --exclude=/dev \
-        --exclude=/tmp \
-        --exclude=/run \
-        --exclude="$BACKUP_DIR" \
-        /
-
-    echo
-    echo "✅ 备份完成！"
-    echo "备份文件已保存到：$BACKUP_FILE"
+    BACKUP_FILE=$(generate_backup_name)
+    echo "开始备份 VPS 根目录..."
+    echo "排除目录: $EXCLUDE_DIRS"
+    tar -czpf "$BACKUP_FILE" --exclude=$EXCLUDE_DIRS /
+    if [ $? -eq 0 ]; then
+        echo "备份完成！文件存储在: $BACKUP_FILE"
+    else
+        echo "备份失败，请检查权限和空间"
+    fi
+    read -p "按回车返回菜单..."
 }
 
-# --------------------------
-# 函数：恢复 VPS
-# --------------------------
+# 列出已有备份
+list_backups() {
+    echo "现有备份文件列表:"
+    ls -lh "$BACKUP_DIR" | grep "vps-backup-"
+}
+
+# 恢复函数
 restore_vps() {
-    echo "可用备份文件列表："
-    ls -1 "$BACKUP_DIR"/*.tar.gz 2>/dev/null || { echo "没有找到备份文件！"; return; }
-
-    read -rp "请输入要恢复的备份文件名（完整路径或文件名）: " FILE
-    # 自动补全路径
-    [[ ! "$FILE" =~ ^/ ]] && FILE="$BACKUP_DIR/$FILE"
-
-    if [[ ! -f "$FILE" ]]; then
-        echo "❌ 备份文件不存在！"
+    list_backups
+    echo
+    read -p "请输入要恢复的备份文件名（完整路径或相对 $BACKUP_DIR）: " FILE
+    if [ ! -f "$FILE" ]; then
+        echo "备份文件不存在！"
+        read -p "按回车返回菜单..."
         return
     fi
 
-    echo "⚠️ 注意：恢复操作会覆盖 VPS 当前文件！"
-    read -rp "确认恢复？输入 yes 继续: " CONFIRM
-    if [[ "$CONFIRM" != "yes" ]]; then
+    echo "恢复操作不可逆！确认要从 $FILE 恢复 VPS 吗？(y/n)"
+    read CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
         echo "已取消恢复"
+        read -p "按回车返回菜单..."
         return
     fi
 
-    echo "正在恢复..."
+    echo "开始恢复 VPS..."
     tar -xzpf "$FILE" -C /
-    echo "✅ 恢复完成！"
-    echo "建议重启 VPS 以确保系统正常运行"
+    if [ $? -eq 0 ]; then
+        echo "恢复完成！"
+    else
+        echo "恢复失败，请检查权限和空间"
+    fi
+    read -p "按回车返回菜单..."
 }
 
-# --------------------------
-# 主菜单循环
-# --------------------------
+# 主菜单
 while true; do
-    echo "==============================="
-    echo "      VPS 备份与恢复管理       "
-    echo "==============================="
+    clear
+    echo "====================================="
+    echo "       VPS 备份与恢复菜单脚本        "
+    echo "====================================="
     echo "1) 备份整个 VPS"
-    echo "2) 恢复 VPS"
-    echo "3) 查看备份文件列表"
-    echo "4) 退出"
-    read -rp "请输入选项: " CHOICE
-    case "$CHOICE" in
+    echo "2) 查看已有备份"
+    echo "3) 恢复 VPS"
+    echo "0) 退出"
+    echo "====================================="
+    read -p "请选择操作 [0-3]: " choice
+
+    case "$choice" in
         1) backup_vps ;;
-        2) restore_vps ;;
-        3) ls -lh "$BACKUP_DIR"/*.tar.gz 2>/dev/null || echo "没有备份文件" ;;
-        4) exit 0 ;;
-        *) echo "❌ 无效选项，请重新输入" ;;
+        2) list_backups; read -p "按回车返回菜单..." ;;
+        3) restore_vps ;;
+        0) echo "退出脚本"; exit 0 ;;
+        *) echo "无效选项，请重新选择"; sleep 1 ;;
     esac
 done
