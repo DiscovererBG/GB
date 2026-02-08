@@ -1,8 +1,6 @@
 #!/bin/bash
 # ==============================================
-# VPS 全量备份与恢复脚本（安全版+美化菜单+自动创建目录+自动清理+备份完成时间+可访问目录）
-# ==============================================
-
+# VPS 全量备份与恢复脚本（安全+美化+权限修复+自动清理+完成时间）
 # ==============================================
 
 # ===============================
@@ -11,11 +9,10 @@
 BACKUP_DIR="/home/ccbg/backup"
 DATE=$(date +%F)
 
-# 自动创建备份目录，权限 755，方便普通用户进入
+# 自动创建备份目录
 if [ ! -d "$BACKUP_DIR" ]; then
     echo "备份目录 $BACKUP_DIR 不存在，正在创建..."
     mkdir -p "$BACKUP_DIR"
-    chmod 755 "$BACKUP_DIR"   # 普通用户可以进入
     echo "目录创建完成！"
 fi
 
@@ -25,6 +22,14 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[1;34m'
 NC='\033[0m' # No Color
+
+# ===============================
+# 设置目录和文件权限
+# ===============================
+set_permissions() {
+    chmod 755 "$BACKUP_DIR"                # 目录可访问，可通过 Web 下载
+    chmod 644 "$BACKUP_DIR"/vps-backup-*.tar.gz 2>/dev/null  # 文件可下载
+}
 
 # ===============================
 # 全量备份函数
@@ -41,12 +46,8 @@ backup() {
         --exclude=/dev \
         --exclude=/tmp \
         --exclude=/run \
-        --exclude="$BACKUP_DIR" \
         --one-file-system \
         / 2>/dev/null
-
-    # 设置备份文件权限，只有拥有者可读写
-    chmod 600 "$FILE"
 
     END_TIME=$(date +"%Y-%m-%d %H:%M:%S")
     if [ $? -eq 0 ]; then
@@ -56,7 +57,10 @@ backup() {
         echo "完成时间：$END_TIME"
         ls -lh "$FILE"
 
-        # 自动清理 2 天前的备份
+        # 设置权限
+        set_permissions
+
+        # 自动清理 2 天前的旧备份
         echo -e "${YELLOW}正在清理 2 天前的旧备份...${NC}"
         find "$BACKUP_DIR" -type f -name "vps-backup-*.tar.gz" -mtime +1 -exec rm -f {} \;
         echo "清理完成！"
@@ -71,14 +75,6 @@ backup() {
 restore() {
     echo -e "${YELLOW}请输入要恢复的备份文件完整路径（例如 /home/ccbg/backup/vps-backup-2026-02-08.tar.gz）：${NC}"
     read -r RESTORE_FILE
-
-    RESTORE_DIR=$(dirname "$RESTORE_FILE")
-    if [ ! -d "$RESTORE_DIR" ]; then
-        echo "备份文件所在目录 $RESTORE_DIR 不存在，正在创建..."
-        mkdir -p "$RESTORE_DIR"
-        chmod 755 "$RESTORE_DIR"
-        echo "目录创建完成！"
-    fi
 
     if [ ! -f "$RESTORE_FILE" ]; then
         echo -e "${RED}错误：备份文件不存在！${NC}"
